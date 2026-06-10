@@ -23,9 +23,9 @@ const MaxPacketLen = 1 << 16 // 64 KiB
 // once. Release returns the buffer to the pool, so a steady send/recv loop
 // allocates nothing.
 //
-// Packet holds no pool pointer: a single package-level pool (pktPool) backs every
-// Packet, which keeps the type a thin {buffer, length} pair and the API
-// allocation-free.
+// Packet holds no pool pointer: two package-level pools — one per size class —
+// back every Packet, and Release routes a Packet home by its buffer's length,
+// which keeps the type a thin {buffer, length} pair and the API allocation-free.
 //
 // Ownership across a Send/receive is defined by Conn (see conn.go): Send BORROWS
 // the Packet — the caller keeps ownership and Releases it exactly once after Send
@@ -33,20 +33,47 @@ const MaxPacketLen = 1 << 16 // 64 KiB
 // and must be Released after use. Double-Release and use-after-Release are bugs;
 // build with -tags transportdebug to have them panic instead of corrupting the pool.
 type Packet struct {
-	buf []byte // backing array from the pool; len == cap == MaxPacketLen
+	buf []byte // backing array from the pool; len == cap == its class's size
 	n   int    // number of valid bytes; the payload window is buf[:n]
 }
 
-// pktPool hands out MaxPacketLen-sized Packets. One package-level pool keeps Get
-// allocation-free after warmup and avoids a per-Packet pool pointer.
-var pktPool = sync.Pool{
-	New: func() any { return &Packet{buf: make([]byte, MaxPacketLen)} },
-}
+// MaxMediaPacketLen is the buffer size of the media size class: room for a media
+// frame's ChannelID byte plus a MaxMediaDatagram payload, rounded up to the IPv6
+// minimum MTU. Media moves thousands of ≤1200-byte datagrams a second; backing
+// them with 64 KiB buffers would pin ~50× the memory they use and thrash the
+// cache, so datagram-sized traffic draws from this second pool (GetMedia) while
+// frames and messages keep the full-size one (Get).
+const MaxMediaPacketLen = 1280
+
+// pktPool hands out MaxPacketLen-sized Packets and medPool MaxMediaPacketLen-
+// sized ones. Package-level pools keep Get/GetMedia allocation-free after warmup
+// and avoid a per-Packet pool pointer; Release tells the classes apart by buffer
+// length.
+var (
+	pktPool = sync.Pool{
+		New: func() any { return &Packet{buf: make([]byte, MaxPacketLen)} },
+	}
+	medPool = sync.Pool{
+		New: func() any { return &Packet{buf: make([]byte, MaxMediaPacketLen)} },
+	}
+)
 
 // Get returns a Packet with a full-capacity buffer and zero length. Fill it via
 // Buf() + SetLen, then Send it or hand it on; Release it exactly once when done.
 func Get() *Packet {
 	p := pktPool.Get().(*Packet)
+	p.n = 0
+	dbgGet(p)
+	return p
+}
+
+// GetMedia returns a Packet from the media size class: a MaxMediaPacketLen
+// buffer, sized for one media datagram. The lifecycle and ownership rules are
+// exactly Get's — same Release, same debug guards — only the capacity differs,
+// so SetLen past MaxMediaPacketLen panics. Use it for datagram-sized payloads;
+// use Get for anything bigger (messages up to MaxPacketLen).
+func GetMedia() *Packet {
+	p := medPool.Get().(*Packet)
 	p.n = 0
 	dbgGet(p)
 	return p
@@ -86,10 +113,15 @@ func (p *Packet) Bytes() []byte {
 	return p.buf[:p.n]
 }
 
-// Release returns the Packet's buffer to the pool. Call it exactly once, after
-// the last use of Bytes(). After Release the Packet must not be touched.
+// Release returns the Packet's buffer to its size class's pool — the buffer
+// length says which class the Packet belongs to. Call it exactly once, after the
+// last use of Bytes(). After Release the Packet must not be touched.
 func (p *Packet) Release() {
 	dbgRelease(p)
 	p.n = 0
+	if len(p.buf) == MaxMediaPacketLen {
+		medPool.Put(p)
+		return
+	}
 	pktPool.Put(p)
 }

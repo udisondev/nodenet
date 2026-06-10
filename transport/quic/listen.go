@@ -137,14 +137,28 @@ func ListenPacketConn(id *identity.Identity, pc net.PacketConn, opts ...Option) 
 	}
 	tlsConf := tlsConfig(cert)
 
+	// The overlay's dial config: no datagrams (the overlay never uses them —
+	// they would let a call starve transit inside one connection), generous
+	// idle, overlay-owned keepalive. The LISTENER must serve both planes with
+	// one config, so it enables datagrams and the media stream cap. An overlay
+	// edge WE dial never negotiates datagrams (this config); on an ACCEPTED
+	// overlay edge a foreign dialer may negotiate them, but our overlay code
+	// never reads datagrams, so anything it sends dies in quic-go's small
+	// bounded receive queue — wasted bytes for the sender, no resource growth
+	// here. Per RFC 9000 a media session's effective idle timeout is the min
+	// of both ends — the media dialer's 10 s — regardless of the listener's
+	// overlay-sized value here.
 	qconf := &quicgo.Config{
 		MaxIdleTimeout:       cfg.idleTimeout,
 		KeepAlivePeriod:      cfg.keepAlivePeriod,
 		HandshakeIdleTimeout: cfg.handshakeTimeout,
 		EnableDatagrams:      false,
 	}
+	lconf := qconf.Clone()
+	lconf.EnableDatagrams = true
+	lconf.MaxIncomingUniStreams = maxMediaUniStreams
 	tr := &quicgo.Transport{Conn: pc}
-	ln, err := tr.Listen(tlsConf, qconf)
+	ln, err := tr.Listen(listenerTLSConfig(tlsConf), lconf)
 	if err != nil {
 		_ = tr.Close()
 		return nil, err
@@ -176,11 +190,15 @@ func ListenPacketConn(id *identity.Identity, pc net.PacketConn, opts ...Option) 
 		ln:           ln,
 		tlsConf:      tlsConf,
 		qconf:        qconf,
+		mediaTLS:     mediaTLSConfig(tlsConf),
+		mediaQConf:   mediaQUICConfig(),
 		ctx:          ctx,
 		cancel:       cancel,
 		in:           make(chan transport.Delivery, cfg.inboundBuffer),
+		inMedia:      make(chan transport.MediaSession, inMediaBuffer),
 		done:         make(chan struct{}),
 		conns:        make(map[*quicConn]struct{}),
+		mediaSess:    make(map[*mediaSession]struct{}),
 		relays:       make(map[*relaySession]func()),
 	}
 	t.wg.Add(2)

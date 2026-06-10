@@ -2,9 +2,12 @@
 // implementation of transport.Transport for tests. It mirrors enough of the QUIC
 // transport's semantics — bidirectional edges keyed by NodeID, framed send/recv,
 // a single inbound stream, authenticated dial — that code written against the
-// transport.Transport interface runs unchanged on both, but it does no crypto, no
-// I/O, and spawns no background goroutines, so a cluster of mem transports runs
-// fully deterministically under testing/synctest with the fake clock.
+// transport.Transport interface runs unchanged on both, but it does no crypto and
+// no I/O, so a cluster of mem transports runs fully deterministically under
+// testing/synctest with the fake clock. The overlay plane spawns no goroutines
+// at all; the media plane (transport.Media, see media.go) runs a pump and a
+// watchdog per session — they exit when the session or its transport closes, so
+// tests that close what they open keep the synctest bubble drainable.
 //
 // A Hub is the shared fabric: every mem transport registers with one Hub, and
 // Dial resolves a peer through it and wires a paired edge. Bring up N transports
@@ -34,12 +37,14 @@ type memTransport struct {
 	id   kad.ID
 	addr transport.Addr
 
-	in   chan transport.Delivery // single inbound stream; closed by Close
-	done chan struct{}           // closed first by Close to unblock in-flight delivers
+	in      chan transport.Delivery     // single inbound stream; closed by Close
+	inMedia chan transport.MediaSession // inbound media sessions; closed by Close
+	done    chan struct{}               // closed first by Close to unblock in-flight delivers
 
-	mu     sync.RWMutex // guards closed/conns; RLock held across a delivery into in
+	mu     sync.RWMutex // guards closed/conns/media; RLock held across a delivery into in
 	closed bool
 	conns  []*memConn
+	media  []*memMediaSession
 
 	closeOnce sync.Once
 }
@@ -121,10 +126,12 @@ func (t *memTransport) deliver(d transport.Delivery, e *edge) error {
 	}
 }
 
-// Close stops accepting, tears down every edge, and closes the inbound stream.
-// It closes done first to unblock any in-flight delivery, then takes the write
-// lock (which drains RLock-holding delivers) before closing in, so in is never
-// closed with a sender still writing to it. Idempotent.
+// Close stops accepting, tears down every edge and media session, and closes
+// the inbound streams. It closes done first to unblock any in-flight delivery,
+// then takes the write lock (which drains RLock-holding delivers) before
+// closing in and inMedia, so neither is ever closed with a sender still
+// writing to it. Media sessions finish asynchronously: closing their shared
+// edges makes each pump unwind and drain its own channels. Idempotent.
 func (t *memTransport) Close() error {
 	t.closeOnce.Do(func() {
 		close(t.done)
@@ -132,13 +139,19 @@ func (t *memTransport) Close() error {
 		t.closed = true
 		conns := t.conns
 		t.conns = nil
+		media := t.media
+		t.media = nil
 		t.mu.Unlock()
 
 		for _, c := range conns {
 			c.edge.close()
 		}
+		for _, s := range media {
+			s.edge.close()
+		}
 		t.hub.remove(t)
 		close(t.in)
+		close(t.inMedia)
 	})
 	return nil
 }

@@ -3,8 +3,12 @@ package quic
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"testing"
+	"time"
+
+	"github.com/udisondev/nodenet/transport"
 )
 
 // nopWriter is a concrete, non-retaining sink, mirroring how quic-go's
@@ -31,6 +35,53 @@ func BenchmarkWriteFrame(b *testing.B) {
 		if _, err := sink.Write(payload); err != nil {
 			b.Fatalf("write payload: %v", err)
 		}
+	}
+}
+
+// BenchmarkMediaSendDatagramQUIC measures the datagram send path over a real
+// loopback connection: our gate (copy into the media pool + tx-ring — proven
+// 0 allocs/op by the mem mirror's benchmarks) plus everything upstream of it.
+// The figure is dominated by quic-go on both ends of the in-process pair (its
+// SendDatagram copies into a fresh frame, its receive path allocates
+// internally); our own additions stay allocation-free, and the receiver's
+// budget gate sheds the flood BEFORE any pool copy, so no pooled buffer churn
+// appears either. A backpressured send (the pump briefly behind) refuses
+// without allocating and stays in the measurement.
+func BenchmarkMediaSendDatagramQUIC(b *testing.B) {
+	a, err := Listen(idFromByte(1), "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("Listen: %v", err)
+	}
+	defer a.Close()
+	peer, err := Listen(idFromByte(2), "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("Listen peer: %v", err)
+	}
+	defer peer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	near, err := a.(transport.Media).OpenMedia(ctx, idFromByte(2).ID(), peer.LocalAddr())
+	if err != nil {
+		b.Fatalf("OpenMedia: %v", err)
+	}
+	far := <-peer.(transport.Media).InboundMedia()
+	defer near.Close()
+	// Drain whatever survives the far end's budget so its queue counters do
+	// not saturate mid-benchmark.
+	go func() {
+		for d := range far.Datagrams() {
+			d.Pkt.Release()
+		}
+	}()
+
+	p := transport.GetMedia()
+	defer p.Release()
+	p.SetLen(transport.MaxMediaDatagram)
+	b.SetBytes(transport.MaxMediaDatagram)
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = near.SendDatagram(transport.FirstAppChannel, p)
 	}
 }
 

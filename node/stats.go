@@ -11,16 +11,29 @@ type Stats struct {
 	DroppedBadSig      uint64 // routed frames whose originator signature did not verify
 	DroppedRateLimited uint64 // control/amplifier frames shed by a rate limiter
 	DroppedInboundFull uint64 // conns refused (and closed) because the inbound-edge cap is reached
+	DroppedEdgeRefused uint64 // edges (in or out) refused by the application's WithEdgeAdmission policy
+
+	// Inbound media-session admission refusals (per-session drops live in the
+	// session's own MediaStats; these count whole sessions this node refused).
+	DroppedMediaSubPoW  uint64 // inbound media sessions from a sub-PoW identity
+	DroppedMediaConsent uint64 // inbound media sessions the consent gate refused (nil gate refuses all)
+	DroppedMediaCap     uint64 // inbound media sessions past the session caps (per node / per IP) or unconsumed
 }
 
 // counters holds the live atomic drop counters. Increments happen on the dispatch
-// goroutine; Stats may be read from any goroutine, so the fields are atomic.
+// goroutine (and, for media admission, the media gate goroutine); Stats may be
+// read from any goroutine, so the fields are atomic.
 type counters struct {
 	subPoW      atomic.Uint64
 	stale       atomic.Uint64
 	badSig      atomic.Uint64
 	rateLimited atomic.Uint64
 	inboundFull atomic.Uint64
+	edgeRefused atomic.Uint64
+
+	mediaSubPoW  atomic.Uint64
+	mediaConsent atomic.Uint64
+	mediaCap     atomic.Uint64
 }
 
 func (c *counters) snapshot() Stats {
@@ -30,5 +43,10 @@ func (c *counters) snapshot() Stats {
 		DroppedBadSig:      c.badSig.Load(),
 		DroppedRateLimited: c.rateLimited.Load(),
 		DroppedInboundFull: c.inboundFull.Load(),
+		DroppedEdgeRefused: c.edgeRefused.Load(),
+
+		DroppedMediaSubPoW:  c.mediaSubPoW.Load(),
+		DroppedMediaConsent: c.mediaConsent.Load(),
+		DroppedMediaCap:     c.mediaCap.Load(),
 	}
 }

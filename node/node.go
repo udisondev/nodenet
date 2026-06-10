@@ -77,6 +77,12 @@ var ErrUnsupported = errors.New("node: operation unsupported by transport")
 // tell "peer failed the work" apart from "could not reach the peer" (ErrUnroutable).
 var ErrPoWUnmet = errors.New("node: peer does not meet PoW difficulty")
 
+// ErrEdgeRefused means the application's own edge-admission policy
+// (WithEdgeAdmission) refused the peer, so the dialed connection was closed
+// instead of becoming a live edge. The peer was reachable and cleared every
+// verifiable gate — this is a local choice, not a network failure.
+var ErrEdgeRefused = errors.New("node: edge refused by local admission policy")
+
 const (
 	defaultInboundBuffer = 64 // delivered-message channel depth
 	hopCandidates        = 8  // next-hop candidates Decide returns (greedy best + repair fallbacks)
@@ -200,6 +206,24 @@ type Node struct {
 	// rate-limit, inbound-cap), for observability under attack. Read via Stats.
 	stats counters
 
+	// Media plane: mediaIn carries inbound sessions that passed the admission
+	// gates (PoW, caps, consent) to the application; mediaConsent is the
+	// application's accept/refuse callback (nil = refuse all, secure by
+	// default); mediaSlots bounds admitted inbound sessions. Media sessions
+	// are application-owned and live OUTSIDE the routing tables: they carry no
+	// transit, count toward no floor, and their death never reaps an edge —
+	// it only triggers an out-of-schedule liveness ping of the edge on the
+	// same path (watchMedia).
+	mediaIn      chan transport.MediaSession
+	mediaConsent func(kad.ID) bool
+	mediaSlots   *mediaSlots
+
+	// edgeAdmission is the application's local edge-admission policy: consulted
+	// with the authenticated NodeID of every peer about to become a live edge,
+	// inbound and outbound alike. nil admits everyone. Level-3 local policy —
+	// the verifiable gates (PoW, caps) run regardless and never defer to it.
+	edgeAdmission func(kad.ID) bool
+
 	// maintenance is the live-edge upkeep policy (intervals, timeouts, backoff). Run
 	// starts the maintenance loop with it unless maintain is false.
 	maintain    bool
@@ -259,6 +283,37 @@ func WithMaintenance(m Maintenance) Option {
 // hole-punch). It has effect only if the transport implements transport.Relayer.
 func WithRelay() Option { return func(n *Node) { n.canRelay = true } }
 
+// WithEdgeAdmission sets the application's policy gate for live edges: it is
+// consulted with the authenticated NodeID of every peer about to become one —
+// inbound on its first frame, outbound before registration (Connect,
+// hole-punch, relay, the maintenance dialer) — and a false return refuses the
+// edge: the connection is closed, an outbound attempt fails with
+// ErrEdgeRefused, and the refusal is counted in Stats. The callback must be
+// fast and non-blocking (it runs on the dispatch loop).
+//
+// This is level-3 local policy, NOT a security boundary: a refused peer can
+// still route messages to this node through other forwarders (filter those by
+// Inbound.Originator) and still learns whatever any overlay member can learn;
+// security rests on the verifiable gates — PoW, signatures, caps, rate limits
+// — which run regardless of this policy. Mind the cost of generosity in
+// reverse, too: every refused peer is one fewer neighbour to route over, so a
+// broad ban list narrows this node's own connectivity.
+func WithEdgeAdmission(f func(remote ID) bool) Option {
+	return func(n *Node) { n.edgeAdmission = f }
+}
+
+// WithMediaConsent sets the application's gate for inbound media sessions: it
+// is called with the authenticated NodeID of each (PoW-cleared, within-caps)
+// caller, and only a true return admits the session to InboundMedia. Without
+// this option every inbound session is refused — secure by default; an
+// application that takes calls must opt in. The callback runs on the media
+// gate goroutine and must be fast and non-blocking (answering the human's
+// "accept the call?" belongs in the application, on the already-admitted
+// session). level-2 self-protection.
+func WithMediaConsent(f func(remote ID) bool) Option {
+	return func(n *Node) { n.mediaConsent = f }
+}
+
 // WithoutMaintenance disables the maintenance loop: the node forwards and answers
 // control frames but does not dial, keepalive, self-lookup, or exchange on its own.
 // Useful for tests that drive the topology by hand.
@@ -309,6 +364,8 @@ func New(id *identity.Identity, t transport.Transport, opts ...Option) *Node {
 	n.pendingLookup = make(map[[routing.LookupNonceLen]byte]int64)
 	n.probes = make(map[kad.ID]struct{})
 	n.punchSem = make(chan struct{}, maxConcurrentPunch)
+	n.mediaIn = make(chan transport.MediaSession, mediaInBuffer)
+	n.mediaSlots = newMediaSlots()
 	n.k = routing.NewKnowledge(n.self, n.subnetf, n.dmin)
 	n.e = routing.NewEdges(n.self, n.subnetf)
 	return n
@@ -373,6 +430,18 @@ func (n *Node) Run(ctx context.Context) error {
 		}()
 		defer func() { <-maintDone }() // after cancel (LIFO), so the wait terminates
 	}
+	// The media gate runs beside the dispatch loop: inbound media sessions
+	// surface on the transport's own channel, never on Inbound, so they get
+	// their own consumer (and the dispatch loop never blocks on call
+	// admission).
+	if media, ok := n.t.(transport.Media); ok {
+		gateDone := make(chan struct{})
+		go func() {
+			defer close(gateDone)
+			n.mediaGate(ctx, media)
+		}()
+		defer func() { <-gateDone }()
+	}
 	defer cancel()
 	in := n.t.Inbound()
 	for {
@@ -394,6 +463,13 @@ func (n *Node) Run(ctx context.Context) error {
 // did — no separate challenge round is needed. level-2 self-protection: a sub-PoW
 // identity cannot be wedged into the edge table.
 func (n *Node) admit(id kad.ID) bool { return pow.Satisfies(id, n.dmin) }
+
+// allowEdge applies the application's edge-admission policy (WithEdgeAdmission;
+// nil admits everyone). Level-3 local policy: it complements the level-2 admit
+// gate and never substitutes for it.
+func (n *Node) allowEdge(id kad.ID) bool {
+	return n.edgeAdmission == nil || n.edgeAdmission(id)
+}
 
 // verify checks a routed message's originator signature, counting a failure for
 // observability. It is the single VerifySig site so every terminal/amplifying branch
@@ -533,6 +609,15 @@ func (n *Node) handle(d transport.Delivery) {
 				// registered, and its frame is dropped (no forward/relay/rendezvous), so a
 				// cheap identity gets neither an edge nor free transit through us.
 				n.stats.subPoW.Add(1)
+				d.Conn.Close()
+				return
+			}
+			// Level-3 local policy: the application refused this peer as an
+			// edge — closed and dropped exactly like a sub-PoW one. The
+			// verifiable gates above already ran; nothing security-relevant
+			// rests on this refusal.
+			if !n.allowEdge(from) {
+				n.stats.edgeRefused.Add(1)
 				d.Conn.Close()
 				return
 			}
@@ -1269,6 +1354,162 @@ func (n *Node) Connect(ctx context.Context, target kad.ID) (transport.Conn, erro
 	return nil, err
 }
 
+// OpenMedia opens a media session to target — the foundation of a call. The
+// session rides the path of the live overlay edge to target: if one is up, its
+// observed address is dialed directly (same socket, same 4-tuple, the NAT
+// mapping already proven); otherwise the full Connect cascade runs first
+// (rendezvous → direct dial / hole-punch / relay) and the session follows the
+// edge it established. The session is OWNED BY THE CALLER: close it when the
+// call ends; its life never touches the edge tables. Re-establishing after
+// path death (ErrMediaClosed) is a fresh OpenMedia. Several sessions to one
+// peer are legal — open a second over a better path, switch, close the old
+// one (make-before-break).
+//
+// It returns ErrUnsupported if the transport has no media capability,
+// transport.ErrMediaUnsupported if the PEER has none (the edge keeps working —
+// fall back to overlay messaging), or the Connect cascade's error when no path
+// exists. A media dial that fails toward a live edge's own address is treated
+// as a liveness signal about that edge: the edge is pinged out of schedule, so
+// a dead path is reaped and re-dialed instead of being trusted again.
+func (n *Node) OpenMedia(ctx context.Context, target kad.ID) (transport.MediaSession, error) {
+	media, ok := n.t.(transport.Media)
+	if !ok {
+		return nil, ErrUnsupported
+	}
+	conn, ok := n.e.Conn(target)
+	if !ok {
+		var err error
+		if conn, err = n.Connect(ctx, target); err != nil {
+			// Simultaneous connect: the peer's own dial may have landed while
+			// ours was in flight — any live edge serves (see SendDirect).
+			if conn, ok = n.e.Conn(target); !ok {
+				return nil, err
+			}
+		}
+	}
+	sess, err := media.OpenMedia(ctx, target, conn.RemoteAddr())
+	if err != nil {
+		// The anti-zombie coupling: the edge's table entry said this address
+		// is alive, the media dial says otherwise. Ping the edge NOW (not at
+		// the next keepalive tick): a dead conn fails the send and is dropped
+		// on the spot, so the next attempt re-runs the Connect cascade instead
+		// of trusting a zombie. A peer that merely lacks media support, or a
+		// dial the caller cancelled, says nothing about the edge.
+		if !errors.Is(err, transport.ErrMediaUnsupported) && ctx.Err() == nil {
+			n.ping(conn)
+		}
+		return nil, err
+	}
+	n.watchMedia(sess, nil)
+	return sess, nil
+}
+
+// InboundMedia is the stream of inbound media sessions that passed the
+// admission gates: PoW, the session caps, and the application's consent
+// callback (WithMediaConsent — without it everything is refused). The
+// application owns each session it takes and must Close it. The channel
+// drains shut when the node's Run ends (on a transport without media it never
+// yields and never closes).
+func (n *Node) InboundMedia() <-chan transport.MediaSession { return n.mediaIn }
+
+// mediaGate is the inbound-call admission goroutine: it consumes the
+// transport's raw inbound sessions, applies the gates, and hands survivors to
+// the application. On shutdown it closes whatever the application left
+// unclaimed — so no session's goroutines outlive the node's run — and then
+// closes the application's channel (it is the sole writer), so a consumer
+// ranging InboundMedia unblocks when the node stops.
+func (n *Node) mediaGate(ctx context.Context, media transport.Media) {
+	defer func() {
+		n.drainMediaIn()
+		close(n.mediaIn)
+	}()
+	in := media.InboundMedia()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case s, ok := <-in:
+			if !ok {
+				return
+			}
+			n.admitMedia(s)
+		}
+	}
+}
+
+// admitMedia runs one inbound session through the admission gates and either
+// announces it to the application or closes it, counting why.
+func (n *Node) admitMedia(s transport.MediaSession) {
+	// level-2 admission-PoW: an inbound media connection is a NEW admission
+	// point; without the check a call would be a way around the Sybil speed
+	// bump every edge pays.
+	if !n.admit(s.Remote()) {
+		n.stats.mediaSubPoW.Add(1)
+		_ = s.Close()
+		return
+	}
+	// level-2 session caps (per node and per source IP): bound what a flood
+	// of PoW-valid identities can pin — goroutines, pooled buffers, the
+	// consent callback's attention. Reserved before consent so a flood cannot
+	// spam the application's callback either.
+	host := mediaHost(s.RemoteAddr(), n.ipAddressed)
+	if !n.mediaSlots.reserve(host) {
+		n.stats.mediaCap.Add(1)
+		_ = s.Close()
+		return
+	}
+	// The watcher releases the slot when the session ends, however it ends.
+	n.watchMedia(s, func() { n.mediaSlots.release(host) })
+	// level-2 consent: nil gate = refuse all, secure by default.
+	if n.mediaConsent == nil || !n.mediaConsent(s.Remote()) {
+		n.stats.mediaConsent.Add(1)
+		_ = s.Close()
+		return
+	}
+	select {
+	case n.mediaIn <- s:
+	default:
+		// The application is not consuming admitted sessions; refuse rather
+		// than queue unboundedly (bounded queues everywhere).
+		n.stats.mediaCap.Add(1)
+		_ = s.Close()
+	}
+}
+
+// drainMediaIn closes admitted sessions the application never claimed, run at
+// shutdown so their goroutines unwind with the node.
+func (n *Node) drainMediaIn() {
+	for {
+		select {
+		case s := <-n.mediaIn:
+			_ = s.Close()
+		default:
+			return
+		}
+	}
+}
+
+// watchMedia couples one session's end to the overlay's liveness: when the
+// session dies — the application closed it, the peer did, or the path idled
+// out — the watcher runs release (an inbound session's admission slot; nil for
+// an outbound one) and pings the overlay edge on the same path out of
+// schedule. An idle-death is the strongest available hint that the edge's NAT
+// path is dead too: the ping either proves the edge alive (a pong refreshes
+// it) or fails/times out into the reap path, so the next Connect builds a
+// fresh path instead of returning a zombie edge. After a deliberate local
+// close the ping is one spare frame on a healthy edge — harmless.
+func (n *Node) watchMedia(s transport.MediaSession, release func()) {
+	go func() {
+		<-s.Closed()
+		if release != nil {
+			release()
+		}
+		if conn, ok := n.e.Conn(s.Remote()); ok {
+			n.ping(conn)
+		}
+	}()
+}
+
 // pickRelay finds a CanRelay volunteer this node has a live edge to (so the relay can
 // reach both this node and, over its own edge, the callee). It returns the relay's
 // NodeID and whether one was found.
@@ -1626,6 +1867,13 @@ func (n *Node) register(conn transport.Conn, caps routing.Capability, now time.T
 		_ = conn.Close()
 		return nil, ErrPoWUnmet
 	}
+	// Level-3 local policy (WithEdgeAdmission): the application refuses this
+	// peer as an edge; the dialed connection is closed, never registered.
+	if !n.allowEdge(target) {
+		_ = conn.Close()
+		n.stats.edgeRefused.Add(1)
+		return nil, ErrEdgeRefused
+	}
 	if err := n.e.AddEdge(conn, true, caps, now); err != nil {
 		_ = conn.Close()
 		if errors.Is(err, routing.ErrEdgeExists) {
@@ -1847,6 +2095,11 @@ func (n *Node) fill(now time.Time, backoff map[kad.ID]backoffState, pending map[
 	for i := range cands {
 		c := cands[i]
 		if pending[c.ID] || len(c.Addrs) == 0 {
+			continue
+		}
+		// The application's edge policy would refuse this peer at register;
+		// skip it here so the dial workers never waste a cascade on it.
+		if !n.allowEdge(c.ID) {
 			continue
 		}
 		if bs, ok := backoff[c.ID]; ok && now.Before(bs.nextAt) {

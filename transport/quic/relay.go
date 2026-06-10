@@ -20,6 +20,21 @@ const (
 	// maxRelaySessions caps concurrent relay sessions on a volunteer, bounding the
 	// sockets and goroutines an abuser can pin. Level-2 self-protection.
 	maxRelaySessions = 256
+
+	// The volunteer's traffic shaper (level-2 self-protection, on by default):
+	// a token bucket per session (bandwidth + burst + packet rate) and an
+	// aggregate one across all sessions. Exceeding traffic is DROPPED, never a
+	// teardown: the tunnelled QUIC connection sees loss, and its congestion
+	// control — and the application's bandwidth estimator above it — back off,
+	// the only semantics compatible with media. The honest consequence is that
+	// video through a stranger's relay is modest by design; this protects the
+	// volunteer, whose own deployment may raise the numbers.
+	relaySessionRate     = 2_000_000 / 8  // bytes/s (2 Mbit/s) per session
+	relaySessionBurst    = 128 << 10      // bytes
+	relaySessionPPS      = 1000           // packets/s per session
+	relaySessionPPSBurst = 256            // packets
+	relayAggRate         = 16_000_000 / 8 // bytes/s (16 Mbit/s) across all sessions
+	relayAggBurst        = 256 << 10      // bytes
 )
 
 // defaultRelaySocket binds fresh UDP sockets on the same host as the main socket — the
@@ -75,7 +90,7 @@ func (t *quicTransport) AllocateRelay() (transport.Addr, transport.Addr, func(),
 		return transport.Addr{}, transport.Addr{}, nil, err
 	}
 
-	s := &relaySession{a: sa, b: sb, done: make(chan struct{})}
+	s := &relaySession{a: sa, b: sb, agg: &t.relayAgg, done: make(chan struct{})}
 	s.lastActive.Store(time.Now().UnixNano())
 	var once sync.Once
 	closeFn := func() {
@@ -131,6 +146,29 @@ type relaySession struct {
 	bAddr      net.Addr // callee's address, pinned on the first datagram on socket b
 	lastActive atomic.Int64
 	done       chan struct{}
+
+	// Shaper state (level-2, see the constants above): this session's
+	// bandwidth and packet buckets, plus the volunteer-wide aggregate shared
+	// with every other session (nil only when a session is built without an
+	// owning transport, as the white-box tests do — then only the per-session
+	// buckets apply).
+	bw  transport.TokenBucket
+	pps transport.TokenBucket
+	agg *transport.TokenBucket
+}
+
+// allowRelay charges one datagram of n bytes against the session's and the
+// volunteer's shaper buckets, reporting whether it may be forwarded. A refusal
+// is a silent drop — deliberately uncounted, unlike the media plane's own
+// queues: to the tunnelled connection the drop IS the signal (loss its
+// congestion control reacts to), and the relay keeps no per-flow accounting
+// by design — it never even parses what it forwards.
+func (s *relaySession) allowRelay(now time.Time, n int) bool {
+	if !s.pps.Allow(now, relaySessionPPS, relaySessionPPSBurst) ||
+		!s.bw.AllowN(now, float64(n), relaySessionRate, relaySessionBurst) {
+		return false
+	}
+	return s.agg == nil || s.agg.AllowN(now, float64(n), relayAggRate, relayAggBurst)
 }
 
 // pump reads datagrams arriving on `in` (facing one peer), pins that peer's address into
@@ -160,6 +198,13 @@ func (s *relaySession) pump(in, out net.PacketConn, selfAddr, peerAddr *net.Addr
 		s.mu.Unlock()
 		if dst == nil {
 			continue // the other peer has not shown up yet; nowhere to forward
+		}
+		// level-2 self-protection: the shaper. An over-budget datagram is
+		// dropped, never a teardown — the tunnelled QUIC sees loss and backs
+		// off. A dropped datagram does not refresh lastActive either: only
+		// actually-relayed traffic keeps the slot alive.
+		if !s.allowRelay(time.Now(), n) {
+			continue
 		}
 		s.lastActive.Store(time.Now().UnixNano())
 		_, _ = out.WriteTo(buf[:n], dst)

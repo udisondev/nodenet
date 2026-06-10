@@ -22,7 +22,9 @@ type Hub struct {
 	byID    map[kad.ID]*memTransport
 	byAddr  map[transport.Addr]*memTransport
 	inbuf   int
-	blocked map[[2]kad.ID]bool // partitioned NodeID pairs; traffic between them is blackholed
+	blocked map[[2]kad.ID]bool       // partitioned NodeID pairs; traffic between them is blackholed
+	links   map[[2]kad.ID]*linkModel // DIRECTED media link models, keyed (from, to)
+	noMedia map[kad.ID]bool          // nodes flagged as not supporting media (older peers)
 }
 
 // HubOption configures a Hub at construction.
@@ -42,6 +44,8 @@ func NewHub(opts ...HubOption) *Hub {
 		byAddr:  make(map[transport.Addr]*memTransport),
 		inbuf:   defaultInbound,
 		blocked: make(map[[2]kad.ID]bool),
+		links:   make(map[[2]kad.ID]*linkModel),
+		noMedia: make(map[kad.ID]bool),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -62,11 +66,12 @@ func (h *Hub) New(id kad.ID, addr transport.Addr) (transport.Transport, error) {
 		return nil, fmt.Errorf("mem: id %s already registered", id)
 	}
 	t := &memTransport{
-		hub:  h,
-		id:   id,
-		addr: addr,
-		in:   make(chan transport.Delivery, h.inbuf),
-		done: make(chan struct{}),
+		hub:     h,
+		id:      id,
+		addr:    addr,
+		in:      make(chan transport.Delivery, h.inbuf),
+		inMedia: make(chan transport.MediaSession, inMediaBuffer),
+		done:    make(chan struct{}),
 	}
 	h.byID[id] = t
 	h.byAddr[addr] = t
@@ -117,6 +122,48 @@ func (h *Hub) isBlocked(sender, receiver kad.ID) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.blocked[pairKey(sender, receiver)]
+}
+
+// SetLinkProfile installs the media link model for the DIRECTED path from →
+// to: every media datagram travelling that direction runs through it (loss,
+// jitter, reorder, shaper queue, MTU), while the reverse direction and all
+// overlay frames stay untouched. Deterministic: the model draws from a PRNG
+// seeded with the profile's Seed and all delays run on the test's clock.
+// Calling it again replaces the model (fresh PRNG and shaper state).
+func (h *Hub) SetLinkProfile(from, to kad.ID, p LinkProfile) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.links[[2]kad.ID{from, to}] = newLinkModel(p)
+}
+
+// link returns the media link model for the directed path, or nil for an
+// ideal (unmodelled) link. Consulted by session pumps per datagram.
+func (h *Hub) link(from, to kad.ID) *linkModel {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.links[[2]kad.ID{from, to}]
+}
+
+// SetMediaSupport flags whether the node registered as id supports media
+// sessions; the default is supported. An OpenMedia toward a flagged-off peer
+// fails with ErrMediaUnsupported — the deterministic stand-in for an older
+// node that does not speak the media protocol, whose overlay edges keep
+// working untouched.
+func (h *Hub) SetMediaSupport(id kad.ID, supported bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if supported {
+		delete(h.noMedia, id)
+		return
+	}
+	h.noMedia[id] = true
+}
+
+// mediaSupported reports whether the node registered as id accepts media.
+func (h *Hub) mediaSupported(id kad.ID) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return !h.noMedia[id]
 }
 
 // pairKey normalises an unordered NodeID pair into a comparable map key, so a

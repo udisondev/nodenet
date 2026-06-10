@@ -72,18 +72,26 @@ type quicTransport struct {
 	ln           *quicgo.Listener
 	tlsConf      *tls.Config
 	qconf        *quicgo.Config
+	mediaTLS     *tls.Config    // the same identity, media ALPN — for OpenMedia dials
+	mediaQConf   *quicgo.Config // datagrams on, in-call idle/keepalive — for OpenMedia dials
 
 	ctx    context.Context // cancelled by Close to unblock Accept/AcceptStream
 	cancel context.CancelFunc
 
-	in   chan transport.Delivery
-	done chan struct{}
+	in      chan transport.Delivery
+	inMedia chan transport.MediaSession
+	done    chan struct{}
 
-	mu     sync.RWMutex
-	closed bool
-	conns  map[*quicConn]struct{}
-	relays map[*relaySession]func() // live relay sessions → their close funcs, torn down by Close
-	perIP  map[netip.Addr]int       // concurrent inbound connections per source IP, for maxPerIP
+	mu        sync.RWMutex
+	closed    bool
+	conns     map[*quicConn]struct{}
+	mediaSess map[*mediaSession]struct{} // live media sessions, torn down by Close
+	relays    map[*relaySession]func()   // live relay sessions → their close funcs, torn down by Close
+	perIP     map[netip.Addr]int         // concurrent inbound connections per source IP, for maxPerIP
+
+	// relayAgg is the volunteer-wide relay shaper bucket every relay session
+	// charges alongside its own (level-2 self-protection; see relay.go).
+	relayAgg transport.TokenBucket
 
 	wg        sync.WaitGroup
 	closeOnce sync.Once
@@ -118,6 +126,14 @@ func (t *quicTransport) acceptLoop(ctx context.Context) {
 			continue
 		}
 		t.wg.Go(func() {
+			// One listener serves both protocols; the negotiated ALPN says
+			// which plane this connection belongs to. A media connection is a
+			// session, not an edge: it hands its admission slot (release) to
+			// the session, which frees it when the session ends.
+			if qconn.ConnectionState().TLS.NegotiatedProtocol == alpnMedia {
+				t.handleAcceptedMedia(qconn, release)
+				return
+			}
 			defer release()
 			t.handleAccepted(ctx, qconn)
 		})
@@ -274,6 +290,11 @@ func (t *quicTransport) Close() error {
 			conns = append(conns, c)
 		}
 		t.conns = nil
+		sessions := make([]*mediaSession, 0, len(t.mediaSess))
+		for s := range t.mediaSess {
+			sessions = append(sessions, s)
+		}
+		t.mediaSess = nil
 		relays := make([]func(), 0, len(t.relays))
 		for _, closeFn := range t.relays {
 			relays = append(relays, closeFn)
@@ -286,6 +307,9 @@ func (t *quicTransport) Close() error {
 		}
 		for _, c := range conns {
 			_ = c.Close()
+		}
+		for _, s := range sessions {
+			_ = s.Close()
 		}
 		// Tear down relay sessions: an active one refreshes its own idle TTL forever,
 		// so without this it would outlive the transport, pinning sockets and goroutines.
@@ -301,6 +325,9 @@ func (t *quicTransport) Close() error {
 
 		t.wg.Wait()
 		close(t.in)
+		if t.inMedia != nil {
+			close(t.inMedia)
+		}
 	})
 	return nil
 }
