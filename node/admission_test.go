@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/udisondev/nodenet/identity"
-	"github.com/udisondev/nodenet/kad"
 	"github.com/udisondev/nodenet/pow"
 	"github.com/udisondev/nodenet/routing"
 	"github.com/udisondev/nodenet/transport"
@@ -132,9 +131,19 @@ func TestAdmissionKnowledgePoW(t *testing.T) {
 		a := spawn(t, ctx, hub, aSeed, WithDmin(d))
 		b := spawn(t, ctx, hub, bSeed, WithDmin(d)) // PoW-valid sender, clears admission
 
-		sub := kad.ID{0x80, 0xAB, 0xCD}  // 0 leading zero bits — fails d=1
-		good := kad.ID{0x40, 0xAB, 0xCD} // 1 leading zero bit — clears d=1
-		cs := []routing.Contact{{ID: sub}, {ID: good}}
+		// Both listed contacts are keyed (their Ed25519 key hashes to the claimed
+		// NodeID): leading zeros only count as work when bound to a key, so a keyless
+		// leading-zero hint is refused regardless (see routing's keyless-bypass test).
+		// The sub contact's keyed ID fails the threshold; the good one clears it.
+		subSeed := seedSatisfying(t, d, false, aSeed, bSeed)
+		goodSeed := seedSatisfying(t, d, true, aSeed, bSeed, subSeed)
+		subIdn := identity.FromSeed(seedFor(subSeed))
+		goodIdn := identity.FromSeed(seedFor(goodSeed))
+		var subEd, goodEd [32]byte
+		copy(subEd[:], subIdn.EdPublic())
+		copy(goodEd[:], goodIdn.EdPublic())
+		sub, good := subIdn.ID(), goodIdn.ID()
+		cs := []routing.Contact{{ID: sub, EdPub: subEd}, {ID: good, EdPub: goodEd}}
 
 		// b sends a, addressed to a itself, a neighbours response listing both contacts.
 		// The originator is b (PoW-valid), so the frame clears origination-PoW and is

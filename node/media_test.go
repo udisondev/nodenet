@@ -310,38 +310,38 @@ func TestMediaIdleDeathPingsEdge(t *testing.T) {
 	})
 }
 
-// TestMediaSlotsPerIP exercises the per-IP half of the session caps directly
-// (it is inert on the in-memory transport, whose endpoints carry no IP): four
-// sessions from one host fill its allowance, the fifth is refused while
-// another host still gets in, and a release reopens the slot. An empty host
-// (the non-IP transport) is never accounted per-IP.
-func TestMediaSlotsPerIP(t *testing.T) {
+// TestMediaSlotsPerPeer exercises the per-identity half of the session caps
+// directly: four sessions from one NodeID fill its allowance, the fifth is refused
+// while another identity still gets in, and a release reopens the slot. The key is
+// the NodeID, so two identities reaching us through one relay (one shared IP) are
+// NOT collapsed. An empty key disables per-peer accounting.
+func TestMediaSlotsPerPeer(t *testing.T) {
 	slots := newMediaSlots()
-	for i := range maxMediaPerIP {
-		if !slots.reserve("198.51.100.7") {
-			t.Fatalf("reserve #%d under the per-IP cap refused", i)
+	for i := range maxMediaPerPeer {
+		if !slots.reserve("peerA") {
+			t.Fatalf("reserve #%d under the per-peer cap refused", i)
 		}
 	}
-	if slots.reserve("198.51.100.7") {
-		t.Fatal("reserve past maxMediaPerIP allowed")
+	if slots.reserve("peerA") {
+		t.Fatal("reserve past maxMediaPerPeer allowed")
 	}
-	if !slots.reserve("203.0.113.9") {
-		t.Fatal("another host refused while only one host is saturated")
+	if !slots.reserve("peerB") {
+		t.Fatal("another identity refused while only one is saturated (per-relay collapse)")
 	}
-	slots.release("198.51.100.7")
-	if !slots.reserve("198.51.100.7") {
-		t.Fatal("reserve refused after a release freed the host's slot")
+	slots.release("peerA")
+	if !slots.reserve("peerA") {
+		t.Fatal("reserve refused after a release freed the identity's slot")
 	}
 
-	// Empty hosts count toward the node-wide cap only.
+	// Empty keys count toward the node-wide cap only.
 	fresh := newMediaSlots()
 	for i := range maxMediaSessions {
 		if !fresh.reserve("") {
-			t.Fatalf("hostless reserve #%d refused below the node cap", i)
+			t.Fatalf("keyless reserve #%d refused below the node cap", i)
 		}
 	}
 	if fresh.reserve("") {
-		t.Fatal("hostless reserve past maxMediaSessions allowed")
+		t.Fatal("keyless reserve past maxMediaSessions allowed")
 	}
 }
 

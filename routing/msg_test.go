@@ -180,6 +180,39 @@ func TestDecodeMsgOversizedLengths(t *testing.T) {
 	}
 }
 
+// TestDecodeMsgRejectsOversizeAvoid: the avoid-set is unsigned level-3 path data
+// the forwarder still scans linearly for every candidate, so a hostile navoid must
+// be refused at decode — bounding it by the buffer alone (up to ~2040 IDs in a
+// 64 KiB frame) let an attacker drive O(navoid) work per hop. A legitimate copy
+// carries at most KMin-1 IDs.
+func TestDecodeMsgRejectsOversizeAvoid(t *testing.T) {
+	// Build an avoid-set one over the cap; a big buffer keeps the old buffer-guard
+	// from tripping, so only the new protocol cap can reject it.
+	ids := make([]kad.ID, MaxAvoid+1)
+	for i := range ids {
+		ids[i] = fill(byte(i + 1))
+	}
+	m := Msg{Target: fill(1), TTL: 5, EdPub: fill32(2), Avoid: avoidOf(ids...), Payload: []byte("x"), Sig: sigOf(7)}
+	buf := make([]byte, 1<<16)
+	n, err := EncodeMsg(buf, &m)
+	if err != nil {
+		t.Fatalf("EncodeMsg: %v", err)
+	}
+	if _, err := DecodeMsg(buf[:n]); !errors.Is(err, ErrAvoidTooLarge) {
+		t.Fatalf("DecodeMsg(navoid=%d) err = %v, want ErrAvoidTooLarge", MaxAvoid+1, err)
+	}
+
+	// Boundary positive: navoid == MaxAvoid decodes without error.
+	m.Avoid = avoidOf(ids[:MaxAvoid]...)
+	n, err = EncodeMsg(buf, &m)
+	if err != nil {
+		t.Fatalf("EncodeMsg(boundary): %v", err)
+	}
+	if _, err := DecodeMsg(buf[:n]); err != nil {
+		t.Fatalf("DecodeMsg(navoid=%d) err = %v, want nil", MaxAvoid, err)
+	}
+}
+
 func TestEncodeMsgShortBuffer(t *testing.T) {
 	m := Msg{Target: fill(1), Payload: make([]byte, 200)}
 	if _, err := EncodeMsg(make([]byte, 16), &m); !errors.Is(err, wire.ErrShortBuffer) {

@@ -120,3 +120,20 @@ func TestInboundCapPerIP(t *testing.T) {
 		t.Fatal("after release a fresh connection from the same IP was refused")
 	}
 }
+
+// TestDialConfigDeniesPeerStreams: on an overlay edge WE dial, the peer must not be
+// able to open any stream — we open the single bidi and both directions ride it. The
+// dial config therefore denies incoming bidi and uni streams (negative = none in
+// quic-go), so a peer cannot stuff data into extra streams that quic-go would buffer
+// past the per-frame PoW gate. The listener config keeps accepting the peer's overlay
+// bidi and media uni-streams; its extras are reset by the accept-path drain instead.
+func TestDialConfigDeniesPeerStreams(t *testing.T) {
+	tr := listenLoopback(t, idFromByte(1))
+	qt := tr.(*quicTransport)
+	if qt.qconf.MaxIncomingStreams >= 0 {
+		t.Errorf("dial config MaxIncomingStreams = %d, want negative (deny peer bidi)", qt.qconf.MaxIncomingStreams)
+	}
+	if qt.qconf.MaxIncomingUniStreams >= 0 {
+		t.Errorf("dial config MaxIncomingUniStreams = %d, want negative (deny peer uni)", qt.qconf.MaxIncomingUniStreams)
+	}
+}

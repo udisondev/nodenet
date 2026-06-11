@@ -57,6 +57,19 @@ const (
 // hostile count cannot drive an absurd allocation.
 const minContactWireLen = 3*kad.IDLen + 4 + 1 // id + ed_pub + x_pub + caps + uvarint(0 addrs)
 
+// maxNeighborsContacts and maxNeighborsAddrs are level-2 self-protection caps the
+// neighbours decoder enforces on every untrusted answer, independent of the frame
+// size. A legitimate TypeNeighbors carries at most the Siblings closest contacts
+// plus the responder itself, each advertising only a handful of reach candidates
+// (direct/punch/relay). Bounding the declared counts against these constants — not
+// just the remaining buffer — keeps the decoder's allocation a protocol constant,
+// closing the empty-address amplification (two wire bytes expand to a 32-byte
+// transport.Addr plus scan bookkeeping, ~32x) that a buffer-only bound allowed.
+const (
+	maxNeighborsContacts = Siblings + 1
+	maxNeighborsAddrs    = 256
+)
+
 // LookupNonceLen is the width of the correlation nonce a lookup/sibling request carries
 // and its neighbours answer echoes. It lets a requester accept only an answer to a request
 // it actually made: the nonce is fresh random bytes the originator keeps, so an off-path
@@ -295,6 +308,11 @@ func scanNeighbors(b []byte) (nc, totalAddr, totalStr int, err error) {
 	if err != nil {
 		return 0, 0, 0, err
 	}
+	// level-2 self-protection: refuse an over-count before allocating, against both
+	// the protocol cap and the remaining buffer.
+	if cnt > maxNeighborsContacts {
+		return 0, 0, 0, wire.ErrShortBuffer
+	}
 	if cnt > uint64(r.Remaining()/minContactWireLen) {
 		return 0, 0, 0, wire.ErrShortBuffer
 	}
@@ -341,6 +359,11 @@ func scanNeighbors(b []byte) (nc, totalAddr, totalStr int, err error) {
 				return 0, 0, 0, err
 			}
 			totalAddr++
+			// level-2 self-protection: cap the total addresses across the whole
+			// answer so a flood of cheap empty addresses cannot amplify allocation.
+			if totalAddr > maxNeighborsAddrs {
+				return 0, 0, 0, wire.ErrShortBuffer
+			}
 			totalStr += int(nl) + int(el)
 		}
 	}

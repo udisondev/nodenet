@@ -23,6 +23,7 @@ package mem
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/udisondev/nodenet/kad"
 	"github.com/udisondev/nodenet/transport"
@@ -78,9 +79,11 @@ func (t *memTransport) Dial(
 	}
 
 	e := &edge{closed: make(chan struct{})}
-	// near is the dialer's handle; far is the peer's view of the same edge.
-	near := &memConn{remote: peer.id, remoteAddr: peer.addr, peerOwner: peer, edge: e}
-	far := &memConn{remote: t.id, remoteAddr: t.addr, peerOwner: t, edge: e}
+	// near is the dialer's handle; far is the peer's view of the same edge. owner is the
+	// transport that holds each end (where it is registered for cleanup): near lives in
+	// the dialer t, far in the peer.
+	near := &memConn{remote: peer.id, remoteAddr: peer.addr, owner: t, peerOwner: peer, edge: e}
+	far := &memConn{remote: t.id, remoteAddr: t.addr, owner: peer, peerOwner: t, edge: e}
 	near.peerConn = far
 	far.peerConn = near
 
@@ -88,10 +91,32 @@ func (t *memTransport) Dial(
 		return nil, transport.ErrConnClosed
 	}
 	if !peer.addConn(far) {
+		// Second registration failed: deregister near so a failed dial leaves no
+		// dangling conn in the dialer's list.
+		t.removeConn(near)
 		near.edge.close()
 		return nil, transport.ErrNoRoute
 	}
 	return near, nil
+}
+
+// removeConn deregisters c from this transport's conn list (swap-removal). It is a
+// no-op if c is absent or the transport is already closed (Close took the whole list).
+func (t *memTransport) removeConn(c *memConn) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return
+	}
+	for i, x := range t.conns {
+		if x == c {
+			last := len(t.conns) - 1
+			t.conns[i] = t.conns[last]
+			t.conns[last] = nil
+			t.conns = t.conns[:last]
+			return
+		}
+	}
 }
 
 // addConn registers a conn for Close cleanup; it reports false if the transport
@@ -109,19 +134,54 @@ func (t *memTransport) addConn(c *memConn) bool {
 // deliver pushes one frame onto this transport's inbound stream. It holds RLock
 // for the whole channel operation so Close cannot close in underneath it, and
 // selects on done and the edge so a backpressured send is freed when either the
-// receiving transport or the edge closes.
+// receiving transport or the edge closes. With a Hub send bound set, a deliver that
+// cannot make progress within the bound returns ErrConnClosed — mirroring the QUIC
+// send deadline so a stalled receiver cannot wedge the sender forever.
 func (t *memTransport) deliver(d transport.Delivery, e *edge) error {
+	return t.deliverBounded(d, e, t.hub.sendBound)
+}
+
+// deliverBounded is deliver with an explicit per-send bound: a non-positive bound is
+// unbounded (the historical default), a positive one returns ErrConnClosed if the
+// send cannot make progress within it. The node's forward path passes a positive
+// bound so a stalled receiver cannot wedge the single dispatch loop even when the Hub
+// has no global send bound. Under testing/synctest the bound runs on the fake clock.
+func (t *memTransport) deliverBounded(d transport.Delivery, e *edge, bound time.Duration) error {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	if t.closed {
 		return transport.ErrConnClosed
 	}
+	if bound <= 0 {
+		select {
+		case t.in <- d:
+			return nil
+		case <-t.done:
+			return transport.ErrConnClosed
+		case <-e.closed:
+			return transport.ErrConnClosed
+		}
+	}
+	// Fast path: deliver without arming a timer when the channel has room.
 	select {
 	case t.in <- d:
 		return nil
 	case <-t.done:
 		return transport.ErrConnClosed
 	case <-e.closed:
+		return transport.ErrConnClosed
+	default:
+	}
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case t.in <- d:
+		return nil
+	case <-t.done:
+		return transport.ErrConnClosed
+	case <-e.closed:
+		return transport.ErrConnClosed
+	case <-timer.C:
 		return transport.ErrConnClosed
 	}
 }

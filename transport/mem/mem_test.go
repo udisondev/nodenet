@@ -103,6 +103,85 @@ func TestPartitionBlackholesAndHeals(t *testing.T) {
 	}
 }
 
+// TestRemoveClearsPerNodeState: closing a transport must drop all per-node soft
+// state the Hub holds for it — partitions, directed link profiles, the media-support
+// flag — so a re-registration of the same identity starts clean instead of inheriting
+// a dead node's partition or link model.
+func TestRemoveClearsPerNodeState(t *testing.T) {
+	h := NewHub()
+	idA, idB := nodeID(1), nodeID(2)
+	a, err := h.New(idA, addr("a"))
+	if err != nil {
+		t.Fatalf("New a: %v", err)
+	}
+	if _, err := h.New(idB, addr("b")); err != nil {
+		t.Fatalf("New b: %v", err)
+	}
+
+	h.Partition(idA, idB)
+	h.SetLinkProfile(idA, idB, LinkProfile{})
+	h.SetMediaSupport(idA, false)
+
+	h.mu.Lock()
+	pre := len(h.blocked) == 1 && len(h.links) == 1 && h.noMedia[idA]
+	h.mu.Unlock()
+	if !pre {
+		t.Fatal("setup: per-node state not installed")
+	}
+
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close a: %v", err)
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.blocked) != 0 {
+		t.Errorf("blocked not cleared: %d entries", len(h.blocked))
+	}
+	if len(h.links) != 0 {
+		t.Errorf("links not cleared: %d entries", len(h.links))
+	}
+	if len(h.noMedia) != 0 {
+		t.Errorf("noMedia not cleared: %d entries", len(h.noMedia))
+	}
+}
+
+// TestMemConnsBounded: closing an edge must deregister both ends from their owning
+// transports, so a long-lived transport that dials and closes many edges does not
+// accumulate dead conns until its own Close. Before the fix each end stayed in its
+// owner's conns slice forever.
+func TestMemConnsBounded(t *testing.T) {
+	h := NewHub()
+	at, err := h.New(nodeID(1), addr("a"))
+	if err != nil {
+		t.Fatalf("New a: %v", err)
+	}
+	bt, err := h.New(nodeID(2), addr("b"))
+	if err != nil {
+		t.Fatalf("New b: %v", err)
+	}
+	a := at.(*memTransport)
+	b := bt.(*memTransport)
+
+	for range 100 {
+		conn, err := a.Dial(context.Background(), b.id, b.addr)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		conn.Close()
+	}
+
+	a.mu.RLock()
+	na := len(a.conns)
+	a.mu.RUnlock()
+	b.mu.RLock()
+	nb := len(b.conns)
+	b.mu.RUnlock()
+	if na != 0 || nb != 0 {
+		t.Fatalf("conns not reclaimed: a=%d b=%d, want 0,0", na, nb)
+	}
+}
+
 func TestHubRegister(t *testing.T) {
 	h := NewHub()
 	idA, idB := nodeID(1), nodeID(2)

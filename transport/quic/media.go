@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	quicgo "github.com/quic-go/quic-go"
@@ -39,8 +40,12 @@ const (
 	// mediaIdleTimeout / mediaKeepAlive: a session's path death is detected
 	// within ~10 s, and the 3 s keepalive (alive only while a session is —
 	// no battery cost outside calls) keeps a healthy path from ever idling
-	// out. The dialer advertises the 10 s bound; QUIC takes the min of both
-	// ends, so it governs accepted sessions too. Level-3 policy.
+	// out. A dialed session advertises this 10 s bound as its QUIC idle. An
+	// ACCEPTED session cannot rely on QUIC's negotiated idle — it is the min of
+	// both ends, so a hostile dialer advertising a long (or disabled) idle would
+	// park the slot far longer — so the accepted side runs its own idle reaper
+	// (idleReap) keyed on the same bound, independent of the peer's value.
+	// Level-3 policy for the bound; the reaper itself is level-2 self-protection.
 	mediaIdleTimeout = 10 * time.Second
 	mediaKeepAlive   = 3 * time.Second
 
@@ -214,7 +219,16 @@ func (t *quicTransport) registerMediaSession(s *mediaSession) bool {
 		return false
 	}
 	t.mediaSess[s] = struct{}{}
-	t.wg.Add(3)
+	// Three goroutines for every session (pump, datagram-rx, stream-rx), plus a
+	// fourth idle reaper for an ACCEPTED session — its effective QUIC idle is the
+	// min of both ends, so it needs a local liveness backstop independent of the
+	// peer's advertised value. A dialed session uses our own short media idle, so
+	// it needs none.
+	if s.accepted() {
+		t.wg.Add(4)
+	} else {
+		t.wg.Add(3)
+	}
 	return true
 }
 
@@ -256,6 +270,15 @@ type mediaSession struct {
 	rxPPS   transport.TokenBucket // level-2 receive budget: packets
 	stats   transport.MediaCounters
 
+	// lastRx is the Unix-nano time of the last frame received from the peer; an
+	// accepted session's idle reaper closes it when no frame arrives within
+	// mediaIdleTimeout. It exists because the effective QUIC idle of an ACCEPTED
+	// session is the min of both ends' advertised timeouts, so a hostile dialer that
+	// advertises a long (or disabled) idle could otherwise park an accepted session
+	// far past the media budget. The reaper is a local backstop that does not trust
+	// the peer's advertised value.
+	lastRx atomic.Int64
+
 	msgWG sync.WaitGroup // in-flight message readers; the accept loop drains it before closing messages
 
 	releaseInbound func() // inbound-admission slot for an accepted session; nil when dialed
@@ -278,12 +301,43 @@ func newMediaSession(owner *quicTransport, remote kad.ID, qconn *quicgo.Conn, re
 	}
 }
 
-// start launches the session's three goroutines, pairing the wg slots
-// registerMediaSession reserved. It must follow a successful registration.
+// accepted reports whether this session was accepted from a peer's dial (it holds
+// an inbound-admission slot) rather than dialed by us.
+func (s *mediaSession) accepted() bool { return s.releaseInbound != nil }
+
+// start launches the session's goroutines, pairing the wg slots
+// registerMediaSession reserved. It must follow a successful registration. An
+// accepted session also runs an idle reaper (see idleReap).
 func (s *mediaSession) start() {
+	s.lastRx.Store(time.Now().UnixNano())
 	go func() { defer s.owner.wg.Done(); s.pump() }()
 	go func() { defer s.owner.wg.Done(); s.rxDatagrams() }()
 	go func() { defer s.owner.wg.Done(); s.rxStreams() }()
+	if s.accepted() {
+		go func() { defer s.owner.wg.Done(); s.idleReap() }()
+	}
+}
+
+// idleReap closes an accepted session whose peer has gone silent for longer than
+// mediaIdleTimeout — a local liveness backstop that does not trust the dialer's
+// advertised QUIC idle. The receive loops stamp lastRx on every frame, so a real
+// call (which carries frames) is never reaped; only a session whose peer stops
+// sending — a hostile dialer parking a slot, or a dead path — is closed. It checks
+// twice per idle window and exits when the session closes.
+func (s *mediaSession) idleReap() {
+	t := time.NewTicker(mediaIdleTimeout / 2)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.closedCh:
+			return
+		case now := <-t.C:
+			if now.UnixNano()-s.lastRx.Load() > mediaIdleTimeout.Nanoseconds() {
+				_ = s.Close()
+				return
+			}
+		}
+	}
 }
 
 func (s *mediaSession) Remote() kad.ID                            { return s.remote }
@@ -325,6 +379,14 @@ func (s *mediaSession) SendDatagram(ch uint8, p *transport.Packet) error {
 	case <-s.closedCh:
 		return transport.ErrMediaClosed
 	default:
+	}
+	// Refuse a full ring early, before the pool round-trip and frame copy: a frame the
+	// ring rejects is wasted work on the congestion-refusal path. The guarded enqueue
+	// below stays authoritative for racing senders (one may fill the ring between this
+	// check and the send).
+	if len(s.txRing) == cap(s.txRing) {
+		s.stats.TxDroppedQueue.Add(1)
+		return transport.ErrMediaBackpressure
 	}
 	q := transport.GetMedia()
 	n, err := transport.PutMediaFrame(q.Buf(), ch, p.Bytes())
@@ -481,6 +543,7 @@ func (s *mediaSession) rxDatagrams() {
 			return
 		}
 		now := time.Now()
+		s.lastRx.Store(now.UnixNano()) // any frame from the peer is a sign of life (idle reaper)
 		// level-2 self-protection: bytes+packets budget, charged before the
 		// frame costs a pool buffer or a copy.
 		if !s.rxPPS.Allow(now, transport.MediaRxPPSRate, transport.MediaRxPPSBurst) ||
@@ -523,6 +586,7 @@ func (s *mediaSession) rxStreams() {
 			_ = s.Close()
 			return
 		}
+		s.lastRx.Store(time.Now().UnixNano()) // a message stream is a sign of life (idle reaper)
 		s.msgWG.Go(func() { s.readMessage(str) })
 	}
 }

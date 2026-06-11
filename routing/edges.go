@@ -3,6 +3,7 @@ package routing
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/udisondev/nodenet/kad"
@@ -112,7 +113,11 @@ type Edges struct {
 	subnetf SubnetFunc
 	mu      sync.RWMutex
 	byID    map[kad.ID]*edge
-	list    []*edge           // same edges as byID, in a flat slice the read paths scan
+	list    []*edge // same edges as byID, in a flat slice the read paths scan
+	// buckets indexes the same edges by common-prefix length with self, so Closest
+	// (the forward hot path) walks only the closeness tiers that can hold a next-hop
+	// instead of scanning the whole set — the same CPL-tiered walk Knowledge uses.
+	buckets [BucketCount][]*edge
 	out     int               // self-maintained (outgoing) edges; the floor counts these
 	in      int               // inbound (peer-initiated) edges; capped by InboundCap
 	subnets map[Subnet]uint16 // live-edge count per subnet, for diversification
@@ -127,10 +132,11 @@ type edge struct {
 	subnet    Subnet
 	hasSubnet bool
 	caps      Capability
-	lastSeen  time.Time   // creation time, refreshed by Touch on any activity; read by Idle
+	lastSeen  atomic.Int64 // Unix-nanos; creation time, refreshed by Touch on any activity, read by Idle
 	ctrl      TokenBucket // per-edge control-frame rate limiter (level-2)
 	fwd       TokenBucket // per-edge routed-frame rate limiter (level-2, see ForwardBurst)
 	idx       int         // this edge's position in Edges.list, for O(1) swap-removal
+	bpos      int         // this edge's position in its CPL bucket, for O(1) swap-removal
 }
 
 // TokenBucket is the shared time-based rate limiter, re-exported from transport (the
@@ -169,7 +175,8 @@ func (e *Edges) AddEdge(conn transport.Conn, outgoing bool, caps Capability, now
 	if !outgoing && e.in >= InboundCap {
 		return ErrInboundFull
 	}
-	ed := &edge{conn: conn, id: id, outgoing: outgoing, caps: caps, lastSeen: now}
+	ed := &edge{conn: conn, id: id, outgoing: outgoing, caps: caps}
+	ed.lastSeen.Store(now.UnixNano())
 	if s, ok := e.subnetf(conn.RemoteAddr()); ok {
 		ed.subnet, ed.hasSubnet = s, true
 		e.subnets[s]++
@@ -177,6 +184,9 @@ func (e *Edges) AddEdge(conn transport.Conn, outgoing bool, caps Capability, now
 	e.byID[id] = ed
 	ed.idx = len(e.list)
 	e.list = append(e.list, ed)
+	bi := kad.CommonPrefixLen(e.self, id)
+	ed.bpos = len(e.buckets[bi])
+	e.buckets[bi] = append(e.buckets[bi], ed)
 	if outgoing {
 		e.out++
 	} else {
@@ -202,6 +212,14 @@ func (e *Edges) RemoveEdge(id kad.ID) {
 	e.list[ed.idx] = last
 	e.list[len(e.list)-1] = nil // drop the duplicated pointer so it can be GC'd
 	e.list = e.list[:len(e.list)-1]
+	// Mirror the swap-removal in the CPL bucket index.
+	bi := kad.CommonPrefixLen(e.self, id)
+	bk := e.buckets[bi]
+	lastb := bk[len(bk)-1]
+	lastb.bpos = ed.bpos
+	bk[ed.bpos] = lastb
+	bk[len(bk)-1] = nil
+	e.buckets[bi] = bk[:len(bk)-1]
 	if ed.outgoing {
 		e.out--
 	} else {
@@ -234,11 +252,16 @@ func (e *Edges) Conn(id kad.ID) (transport.Conn, bool) {
 // edge" from this one lookup under one lock instead of a separate Conn check — it
 // runs on every received frame. The maintenance loop reads last-seen via Idle, so
 // Touch is what keeps a busy edge from being needlessly keepalive-pinged.
+//
+// It runs under a read lock plus an atomic store, so the per-frame refresh never
+// serialises with the other readers (Closest/Idle/Siblings): byID is mutated only
+// under the write lock (AddEdge/RemoveEdge), so the lookup is safe under RLock, and
+// lastSeen is an atomic the concurrent Idle reads with a matching atomic load.
 func (e *Edges) Touch(id kad.ID, now time.Time) bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	if ed, ok := e.byID[id]; ok {
-		ed.lastSeen = now
+		ed.lastSeen.Store(now.UnixNano())
 		return true
 	}
 	return false
@@ -331,16 +354,29 @@ func (e *Edges) Idle(now time.Time, sibTimeout, fingerTimeout time.Duration, buf
 		if ed.role == roleSibling {
 			timeout = sibTimeout
 		}
-		if now.Sub(ed.lastSeen) >= timeout {
+		if now.Sub(time.Unix(0, ed.lastSeen.Load())) >= timeout {
 			buf = append(buf, LiveEdge{ID: ed.id, Conn: ed.conn})
 		}
 	}
 	return buf
 }
 
+// bucketWalkMin is the live-edge count above which Closest walks the CPL-indexed
+// buckets instead of the flat list. The bucket walk skips the far-bucket majority of a
+// large set, but it pays a fixed cost scanning empty bucket tiers (most of the 256
+// prefix lengths are unpopulated); below this size the flat scan is cheaper than that
+// fixed cost, so a small node's forward path stays fast.
+const bucketWalkMin = Siblings
+
 // Closest returns up to n live edges nearest target under the XOR metric, closest
 // first, appended into buf — the next-hop input to greedy forwarding. Pass a buf
 // with capacity ≥ n and it allocates nothing.
+//
+// For a large live set it walks the CPL-indexed buckets tiered off b = CPL(self,
+// target), stopping once the unscanned buckets cannot beat the kept set — the same
+// provably-equivalent walk Knowledge.Closest uses, so the result matches a full scan
+// while skipping the far-bucket majority. For a small set it scans the flat list,
+// which is cheaper than the bucket walk's fixed empty-tier overhead.
 func (e *Edges) Closest(target kad.ID, n int, buf []LiveEdge) []LiveEdge {
 	buf = buf[:0]
 	if n <= 0 {
@@ -348,8 +384,38 @@ func (e *Edges) Closest(target kad.ID, n int, buf []LiveEdge) []LiveEdge {
 	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	for _, ed := range e.list {
-		buf = insertClosestEdge(buf, LiveEdge{ID: ed.id, Conn: ed.conn}, target, n)
+
+	if len(e.list) <= bucketWalkMin {
+		for _, ed := range e.list {
+			buf = insertClosestEdge(buf, LiveEdge{ID: ed.id, Conn: ed.conn}, target, n)
+		}
+		return buf
+	}
+
+	b := kad.CommonPrefixLen(e.self, target)
+	if b < BucketCount {
+		for _, ed := range e.buckets[b] {
+			buf = insertClosestEdge(buf, LiveEdge{ID: ed.id, Conn: ed.conn}, target, n)
+		}
+	}
+	// The >b tier all share exactly b bits with target; scan it only until bucket b
+	// has filled buf with strictly-closer edges (the n-th shares more than b bits).
+	if len(buf) < n || kad.CommonPrefixLen(target, buf[n-1].ID) <= b {
+		for bi := b + 1; bi < BucketCount; bi++ {
+			for _, ed := range e.buckets[bi] {
+				buf = insertClosestEdge(buf, LiveEdge{ID: ed.id, Conn: ed.conn}, target, n)
+			}
+		}
+	}
+	// Buckets below b, descending: bucket bi yields edges sharing exactly bi bits with
+	// target, so once the n-th kept edge shares strictly more, no smaller bucket wins.
+	for bi := b - 1; bi >= 0; bi-- {
+		if len(buf) == n && kad.CommonPrefixLen(target, buf[n-1].ID) > bi {
+			break
+		}
+		for _, ed := range e.buckets[bi] {
+			buf = insertClosestEdge(buf, LiveEdge{ID: ed.id, Conn: ed.conn}, target, n)
+		}
 	}
 	return buf
 }
@@ -420,21 +486,51 @@ func (e *Edges) ReplacementFor(k *Knowledge, target kad.ID, want int, buf []Cont
 // --- internal helpers (caller holds e.mu) ---
 
 // reclassify marks the Siblings edges closest to self as siblings and the rest as
-// fingers. O(n²) over the live set, which is small and only touched on add/remove.
+// fingers. It selects the closest set in a single pass (insertion into a fixed
+// Siblings-wide buffer) and then labels — O(n·Siblings) over the live set, run on
+// every add/remove, rather than the old all-pairs O(n²). The result is identical:
+// XOR distance to self is a total order on distinct IDs, so the "closest Siblings"
+// set is unambiguous.
 func (e *Edges) reclassify() {
+	var top [Siblings]*edge
+	ntop := 0
 	for _, ed := range e.list {
-		closer := 0
-		for _, other := range e.list {
-			if other.id != ed.id && kad.DistanceCmp(e.self, other.id, ed.id) < 0 {
-				closer++
+		ntop = insertClosestSibling(&top, ntop, ed, e.self)
+	}
+	for _, ed := range e.list {
+		ed.role = roleFinger
+	}
+	for i := range ntop {
+		top[i].role = roleSibling
+	}
+}
+
+// insertClosestSibling keeps top[:n] the ≤Siblings edges nearest self, closest
+// first, and returns the new count. It mirrors insertClosestEdge but over *edge
+// with self as the target and a fixed Siblings capacity, so it allocates nothing.
+func insertClosestSibling(top *[Siblings]*edge, n int, ed *edge, self kad.ID) int {
+	if n < Siblings {
+		top[n] = ed
+		for i := n; i > 0; i-- {
+			if kad.DistanceCmp(self, top[i].id, top[i-1].id) < 0 {
+				top[i], top[i-1] = top[i-1], top[i]
+			} else {
+				break
 			}
 		}
-		if closer < Siblings {
-			ed.role = roleSibling
-		} else {
-			ed.role = roleFinger
+		return n + 1
+	}
+	if kad.DistanceCmp(self, ed.id, top[Siblings-1].id) < 0 {
+		top[Siblings-1] = ed
+		for i := Siblings - 1; i > 0; i-- {
+			if kad.DistanceCmp(self, top[i].id, top[i-1].id) < 0 {
+				top[i], top[i-1] = top[i-1], top[i]
+			} else {
+				break
+			}
 		}
 	}
+	return n
 }
 
 // updatePhase recomputes the floor band from the outgoing count. The emergency

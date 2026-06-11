@@ -12,6 +12,45 @@ import (
 	"github.com/udisondev/nodenet/transport"
 )
 
+// TestDeliverIsBounded: with a Hub send bound set, a Send onto a full, undrained
+// inbound channel returns ErrConnClosed within the bound instead of blocking
+// forever — the transport-level guard that keeps a stalled receiver from wedging a
+// sender (and, above, the node's graceful-leave from hanging). Runs on the fake clock.
+func TestDeliverIsBounded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := NewHub(WithInboundBuffer(1), WithSendBound(5*time.Second))
+		ad, err := h.New(nodeID(3), addr("dialer"))
+		if err != nil {
+			t.Fatalf("New dialer: %v", err)
+		}
+		if _, err := h.New(nodeID(2), addr("b")); err != nil {
+			t.Fatalf("New b: %v", err)
+		}
+		conn, err := ad.Dial(context.Background(), nodeID(2), addr("b"))
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+
+		// Fill b's inbound buffer (cap 1); nobody drains b.Inbound().
+		first := transport.Get()
+		first.SetLen(copy(first.Buf(), []byte("one")))
+		if err := conn.Send(first); err != nil {
+			t.Fatalf("first Send: %v", err)
+		}
+		first.Release()
+
+		// Second Send blocks on the full buffer; the bound returns ErrConnClosed once
+		// the fake clock advances past it (synctest drives a durably-blocked sender).
+		second := transport.Get()
+		second.SetLen(copy(second.Buf(), []byte("two")))
+		err = conn.Send(second)
+		second.Release()
+		if !errors.Is(err, transport.ErrConnClosed) {
+			t.Fatalf("bounded Send err = %v, want ErrConnClosed", err)
+		}
+	})
+}
+
 // mediaPair brings up two transports on a fresh hub and opens a media session
 // a→b, returning both ends. Everything is registered for teardown via cleanup
 // so the synctest bubble drains (pumps and watchdogs exit).
@@ -251,6 +290,36 @@ func TestMediaReservedChannelRxDropped(t *testing.T) {
 		case <-far.Datagrams():
 			t.Fatal("reserved-channel frame was delivered")
 		default:
+		}
+	})
+}
+
+// TestPumpDatagramUsesSendTimeProfile: a datagram must be delivered according to the
+// link profile in force when it was SENT, not whatever is installed by the time the
+// pump delivers it. A frame planned under a no-reorder profile, then overtaken by a
+// SetLinkProfile that enables reordering, must still be delivered — the pump must not
+// re-judge an in-flight frame against the new profile.
+func TestPumpDatagramUsesSendTimeProfile(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		hub, near, far, aID, bID := mediaPair(t)
+		defer near.Close()
+
+		// P1: a slow shaper delays the frame so it sits in the pump, planned but not yet
+		// delivered. No reordering.
+		hub.SetLinkProfile(aID, bID, LinkProfile{RateBytesPerSec: 100})
+
+		sendDatagram(t, near, 16, 0xAB)
+		synctest.Wait() // the pump now owns the frame and sleeps on the shaper delay
+
+		// P2 enables aggressive reordering. Under the bug the pump re-reads this profile
+		// at delivery and holds the in-flight frame back; the fix uses the send-time P1.
+		hub.SetLinkProfile(aID, bID, LinkProfile{ReorderEvery: 1, ReorderHold: 100})
+
+		select {
+		case d := <-far.Datagrams():
+			d.Pkt.Release() // delivered per P1 — correct
+		case <-time.After(10 * time.Second):
+			t.Fatal("frame not delivered: pump re-judged an in-flight frame against the new profile")
 		}
 	})
 }

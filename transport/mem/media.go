@@ -130,12 +130,16 @@ func (t *memTransport) deliverMedia(s *memMediaSession) error {
 var _ transport.MediaSession = (*memMediaSession)(nil)
 
 // plannedFrame is one datagram the link model already judged: the encoded
-// frame and the absolute instant the link delivers it (shaper backlog +
+// frame, the absolute instant the link delivers it (shaper backlog +
 // transmission time + jitter, fixed at send time — the moment the frame
-// reached the bottleneck queue).
+// reached the bottleneck queue), and the link model that judged it. Capturing the
+// model here pins the frame to the profile in force at send time, so a
+// SetLinkProfile between send and delivery cannot retroactively re-judge a frame
+// already in flight (and the pump needs no second Hub-lock to re-fetch it).
 type plannedFrame struct {
-	pkt *transport.Packet
-	at  time.Time
+	pkt   *transport.Packet
+	at    time.Time
+	model *linkModel
 }
 
 // memMediaSession is one end of a paired in-memory media session — the
@@ -259,7 +263,8 @@ func (s *memMediaSession) SendDatagram(ch uint8, p *transport.Packet) error {
 
 	now := time.Now()
 	at := now
-	if model := s.owner.hub.link(s.owner.id, s.remote); model != nil {
+	model := s.owner.hub.link(s.owner.id, s.remote)
+	if model != nil {
 		verdict, delay := model.plan(now, transport.MediaFrameLen(p.Len()))
 		switch verdict {
 		case linkDropMTU:
@@ -290,7 +295,7 @@ func (s *memMediaSession) SendDatagram(ch uint8, p *transport.Packet) error {
 		return transport.ErrMediaClosed
 	}
 	select {
-	case s.txRing <- plannedFrame{pkt: q, at: at}:
+	case s.txRing <- plannedFrame{pkt: q, at: at, model: model}:
 		s.txMu.RUnlock()
 		s.stats.TxDatagrams.Add(1)
 		return nil
@@ -374,9 +379,12 @@ func (s *memMediaSession) pumpDatagram(f plannedFrame, timer *time.Timer) {
 	// only after ReorderHold later frames have gone by — "held back for N
 	// deliveries". One frame parks at a time; a trigger while one is parked
 	// just delivers normally.
+	// Use the model captured at send time, not whatever is installed now: a
+	// SetLinkProfile after this frame was planned must not re-judge it (and reading
+	// f.model needs no second Hub-lock per datagram).
 	var profile LinkProfile
-	if model := s.owner.hub.link(s.owner.id, s.remote); model != nil {
-		profile = model.profile // immutable after construction
+	if f.model != nil {
+		profile = f.model.profile // immutable after construction
 	}
 	if profile.ReorderEvery > 0 {
 		s.reorderSeq++

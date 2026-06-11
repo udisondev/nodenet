@@ -87,6 +87,14 @@ const (
 	defaultInboundBuffer = 64 // delivered-message channel depth
 	hopCandidates        = 8  // next-hop candidates Decide returns (greedy best + repair fallbacks)
 
+	// defaultForwardSendDeadline caps a single forward send on the dispatch loop, so a
+	// slow or hostile next-hop cannot freeze frame processing for the whole node. It is
+	// generous (a genuinely stuck edge, not transient congestion, trips it) and matches
+	// the QUIC transport's own default; its job is to keep forwarding bounded even when
+	// the transport was configured with no send deadline (WithSendDeadline(0)), which
+	// would otherwise let one stuck hop wedge the loop forever. level-2 self-protection.
+	defaultForwardSendDeadline = 5 * time.Second
+
 	// maxConcurrentPunch bounds the reactive punch bursts in flight at once. A punch is
 	// spawned in response to an inbound Connect (origination-PoW gated) or RelayBind (over
 	// a relay edge, NOT PoW gated), so without a cap a flood could spawn unbounded punch
@@ -130,6 +138,7 @@ type Node struct {
 	id    *identity.Identity
 	self  kad.ID
 	edPub [32]byte // id.EdPublic() copied once, stamped into every originated message
+	selfC routing.Contact // precomputed self-contact for lookup/sibling answers (its Addrs slice is reused, not reallocated per answer)
 
 	t transport.Transport
 	k *routing.Knowledge
@@ -167,10 +176,21 @@ type Node struct {
 	relayPending map[[nat.NonceLen]byte]chan transport.Addr
 	canRelay     bool
 
+	// relayBuf backs pickRelay's live-edge snapshot, reused across calls so the cold
+	// dial path does not allocate a fresh slice every time. relayBufMu serialises the
+	// concurrent dial paths (maintenance dialer, Connect) that call pickRelay.
+	relayBufMu sync.Mutex
+	relayBuf   []routing.LiveEdge
+
 	// hopsBuf backs Decide's NextHops. The dispatch loop is single-goroutine, so it
 	// is reused across handle calls without locking; Send must NOT touch it (it runs
 	// on the caller's goroutine).
 	hopsBuf []routing.LiveEdge
+
+	// fwdDeadline caps a single forward send on the dispatch loop (see
+	// defaultForwardSendDeadline). A non-positive value falls back to the transport's
+	// own Send (and its global send deadline).
+	fwdDeadline time.Duration
 
 	// reflexive consolidates the externally-visible addresses neighbours report seeing
 	// us at (learned from pongs) into a confirmed address once enough of them agree.
@@ -283,6 +303,35 @@ func WithMaintenance(m Maintenance) Option {
 // hole-punch). It has effect only if the transport implements transport.Relayer.
 func WithRelay() Option { return func(n *Node) { n.canRelay = true } }
 
+// WithForwardSendDeadline caps how long a single forward send may block on the
+// dispatch loop before the next-hop edge is dropped and the next disjoint candidate
+// tried — so a slow or hostile next-hop cannot freeze the whole node, even under a
+// transport configured with no send deadline. A non-positive value falls back to the
+// transport's own Send bound. The default is generous (defaultForwardSendDeadline).
+func WithForwardSendDeadline(d time.Duration) Option {
+	return func(n *Node) { n.fwdDeadline = d }
+}
+
+// boundedSender is the optional Conn capability the forward path uses to bound a
+// single send independently of the transport's global send deadline. Both bundled
+// transports implement it; a Conn that does not falls back to plain Send.
+type boundedSender interface {
+	SendBounded(p *transport.Packet, d time.Duration) error
+}
+
+// forwardSend sends pkt on the dispatch-loop forward path with a bounded budget, so a
+// stuck next-hop cannot wedge the single dispatch loop. It uses the Conn's bounded
+// send when available and a forward deadline is set; otherwise it falls back to Send
+// (whose bound is then the transport's own send deadline). It borrows pkt like Send.
+func (n *Node) forwardSend(c transport.Conn, pkt *transport.Packet) error {
+	if n.fwdDeadline > 0 {
+		if bs, ok := c.(boundedSender); ok {
+			return bs.SendBounded(pkt, n.fwdDeadline)
+		}
+	}
+	return c.Send(pkt)
+}
+
 // WithEdgeAdmission sets the application's policy gate for live edges: it is
 // consulted with the authenticated NodeID of every peer about to become one —
 // inbound on its first frame, outbound before registration (Connect,
@@ -331,6 +380,7 @@ func New(id *identity.Identity, t transport.Transport, opts ...Option) *Node {
 		self:        id.ID(),
 		t:           t,
 		hopsBuf:     make([]routing.LiveEdge, 0, hopCandidates),
+		fwdDeadline: defaultForwardSendDeadline,
 		maintain:    true,
 		maintenance: DefaultMaintenance(),
 		runCtx:      context.Background(),
@@ -368,6 +418,14 @@ func New(id *identity.Identity, t transport.Transport, opts ...Option) *Node {
 	n.mediaSlots = newMediaSlots()
 	n.k = routing.NewKnowledge(n.self, n.subnetf, n.dmin)
 	n.e = routing.NewEdges(n.self, n.subnetf)
+	// Precompute the self-contact once: caps follow canRelay (set by opts above) and
+	// the local address is stable after the transport is listening, so lookup/sibling
+	// answers reuse it instead of allocating a fresh Addrs slice per response.
+	var selfCaps routing.Capability
+	if n.canRelay {
+		selfCaps = routing.CanRelay
+	}
+	n.selfC = routing.Contact{ID: n.self, EdPub: n.edPub, Caps: selfCaps, Addrs: []transport.Addr{t.LocalAddr()}}
 	return n
 }
 
@@ -391,7 +449,8 @@ func (n *Node) Edges() *routing.Edges { return n.e }
 // Knowledge returns the k-bucket knowledge table.
 func (n *Node) Knowledge() *routing.Knowledge { return n.k }
 
-// Deliveries is the stream of messages addressed to this node.
+// Deliveries is the stream of messages addressed to this node. The channel closes
+// when the node's Run returns, so a consumer ranging it unblocks on shutdown.
 func (n *Node) Deliveries() <-chan Inbound { return n.deliver }
 
 // Reflexive returns this node's confirmed externally-visible address — the one
@@ -422,6 +481,12 @@ func (n *Node) Run(ctx context.Context) error {
 	// the transport closing (not just by cancellation) still unwinds all of it.
 	ctx, cancel := context.WithCancel(ctx)
 	n.runCtx = ctx
+	// Close the delivery channel when Run ends, so a consumer ranging Deliveries()
+	// (the documented pattern) unblocks on shutdown instead of leaking its goroutine.
+	// By LIFO this defer runs last — after the dispatch loop has exited (the only writer
+	// to n.deliver) and after the maintenance/media goroutines are joined — so the close
+	// never races a send.
+	defer close(n.deliver)
 	if n.maintain {
 		maintDone := make(chan struct{})
 		go func() {
@@ -532,7 +597,17 @@ func (n *Node) solicited(nonce [routing.LookupNonceLen]byte, now time.Time) bool
 // a dead neighbour must no longer corroborate (or stalely prop up) this node's notion of
 // its own external address. It is the single edge-removal site the dispatch and
 // maintenance paths funnel through.
+//
+// It also closes the transport.Conn before unregistering: otherwise the QUIC connection,
+// its read-loop goroutine and (on the peer side) the inbound slot live on until the idle
+// timeout — and on the in-memory transport, forever — as a zombie nothing reaps. Close is
+// idempotent, so a Send-failure path that already closed the conn is unaffected. level-2
+// self-protection. Conn takes its own RLock; dropEdge holds no edge lock here, and Close
+// is idempotent, so the lookup-then-close is race-free.
 func (n *Node) dropEdge(id kad.ID) {
+	if c, ok := n.e.Conn(id); ok {
+		_ = c.Close()
+	}
 	n.e.RemoveEdge(id)
 	n.reflexive.Remove(id)
 }
@@ -593,6 +668,16 @@ func (n *Node) handle(d transport.Delivery) {
 
 	typ, payload, _, err := wire.ParseFrame(d.Pkt.Bytes())
 	if err != nil {
+		// A peer-initiated conn that is not yet a live edge and sends an unparseable
+		// frame bypasses the admission block below, so it never reaches the PoW gate and,
+		// left open, pins an inbound slot as an untracked zombie (invisible to reap).
+		// Close it. Touch harmlessly refreshes an already-registered edge (a valid peer
+		// may send a frame of a future version — do not tear a live edge for that) and
+		// returns false for an unregistered conn, which we then close. level-2.
+		if d.Conn != nil && !n.e.Touch(d.Conn.Remote(), time.Now()) {
+			n.stats.malformed.Add(1)
+			d.Conn.Close()
+		}
 		return
 	}
 	// A frame proves its edge alive. If the edge is already known, refresh it so a busy
@@ -621,12 +706,19 @@ func (n *Node) handle(d transport.Delivery) {
 				d.Conn.Close()
 				return
 			}
-			if err := n.e.AddEdge(d.Conn, false, 0, now); errors.Is(err, routing.ErrInboundFull) {
-				// level-2 self-protection: past the inbound cap the peer is refused
-				// outright, like a sub-PoW one — closed, frame dropped. Left open it
-				// would be an untracked zombie: no rate-limit bucket, invisible to the
-				// keepalive/reap scan, serving free transit that nothing ever reaps.
-				n.stats.inboundFull.Add(1)
+			if err := n.e.AddEdge(d.Conn, false, 0, now); err != nil {
+				// Any registration failure leaves an untracked conn — no rate-limit
+				// bucket, invisible to the keepalive/reap scan, serving free transit that
+				// nothing ever reaps — so close it rather than fall through and serve the
+				// frame on it. ErrInboundFull is the cap backstop; ErrEdgeExists is a
+				// duplicate from a simultaneous reverse dial (the live edge already
+				// registered between the Touch miss and here); ErrSelfEdge a self-loop.
+				// All level-2 self-protection.
+				if errors.Is(err, routing.ErrInboundFull) {
+					n.stats.inboundFull.Add(1)
+				} else {
+					n.stats.dupInbound.Add(1)
+				}
 				d.Conn.Close()
 				return
 			}
@@ -698,6 +790,14 @@ func (n *Node) handle(d transport.Delivery) {
 		if d.Conn == nil {
 			return
 		}
+		// level-2 per-edge rate-limit: app frames land in the same shared delivery
+		// channel as routed deliveries, so throttle them per edge for parity — one edge
+		// must not flood the channel and starve other edges' deliveries (cross-edge
+		// fairness), nor make this node allocate a copy per frame without bound.
+		if !n.e.AllowForward(from, now) {
+			n.stats.rateLimited.Add(1)
+			return
+		}
 		select {
 		case n.deliver <- Inbound{Originator: from, Payload: append([]byte(nil), payload...)}:
 		default:
@@ -756,7 +856,10 @@ func (n *Node) handleRouted(typ wire.Type, from kad.ID, payload []byte, pkt *tra
 			if hop.ID == from {
 				continue // never forward back over the edge it arrived on
 			}
-			if err := hop.Conn.Send(pkt); err == nil {
+			// Bounded send: a stuck next-hop must not freeze the dispatch loop. A failed
+			// (or timed-out) send drops the edge and falls to the next disjoint candidate
+			// with the SAME buffer (borrow-Send leaves pkt ours, so the retry costs no copy).
+			if err := n.forwardSend(hop.Conn, pkt); err == nil {
 				break
 			}
 			n.dropEdge(hop.ID)
@@ -812,7 +915,11 @@ func (n *Node) handleRouted(typ wire.Type, from kad.ID, payload []byte, pkt *tra
 		}
 		var nonce [routing.LookupNonceLen]byte
 		copy(nonce[:], m.Payload)
-		cs := n.k.Closest(m.Target, routing.Siblings, nil)
+		// Stack-backed: Siblings closest plus self fit in cbuf, so the answer's contact
+		// list and the self append both avoid a heap allocation (cs does not escape —
+		// sendNeighbors only reads it).
+		var cbuf [routing.Siblings + 1]routing.Contact
+		cs := n.k.Closest(m.Target, routing.Siblings, cbuf[:0])
 		cs = append(cs, n.selfContact())
 		n.sendNeighbors(originator, cs, nil, nonce)
 	case routing.TypeNeighbors:
@@ -861,6 +968,15 @@ func (n *Node) handleRouted(typ wire.Type, from kad.ID, payload []byte, pkt *tra
 		// A neighbours response that cannot route all the way back is dropped.
 	case rendezvous.TypeHello:
 		if dec.Kind == routing.KindDeliver {
+			// Authenticate the originator BEFORE charging the rate limit: the
+			// per-originator bucket is keyed on the envelope identity, so a forged
+			// m.EdPub (with no private key to sign) must not create a bucket — that
+			// would both bypass the throttle (a fresh forged originator each time) and
+			// flood the bucket map. Verify mirrors nat.TypeConnect; handleHello's inner
+			// VerifyHello stays as the target-binding gate.
+			if !n.verify(typ, &m) {
+				return
+			}
 			// level-2 rate-limit: answering a hello costs an Ed25519 verify, an Ed25519
 			// reply signature and a 3-path routed reply disclosing this node's
 			// coordinates — the same work and disclosure a Connect costs — so throttle
@@ -1002,7 +1118,9 @@ func (n *Node) handleSiblings(conn transport.Conn, payload []byte) {
 	if err != nil {
 		return
 	}
-	cs := n.k.Closest(n.self, routing.Siblings, nil)
+	// Stack-backed (Siblings closest + self), as in the lookup answer path above.
+	var cbuf [routing.Siblings + 1]routing.Contact
+	cs := n.k.Closest(n.self, routing.Siblings, cbuf[:0])
 	cs = append(cs, n.selfContact())
 	n.sendNeighbors(conn.Remote(), cs, conn, nonce)
 }
@@ -1043,13 +1161,7 @@ func (n *Node) sendNeighbors(target kad.ID, cs []routing.Contact, direct transpo
 // selfContact is this node's own knowledge entry — NodeID, Ed25519 key, and the
 // address peers dial it at — so a neighbours response lets the recipient reach us
 // directly.
-func (n *Node) selfContact() routing.Contact {
-	var caps routing.Capability
-	if n.canRelay {
-		caps = routing.CanRelay
-	}
-	return routing.Contact{ID: n.self, EdPub: n.edPub, Caps: caps, Addrs: []transport.Addr{n.t.LocalAddr()}}
-}
+func (n *Node) selfContact() routing.Contact { return n.selfC }
 
 // Send originates a routing message toward target along up to d (= routing.KMin)
 // disjoint paths: it picks the d closest live edges as distinct first hops and sends
@@ -1448,18 +1560,20 @@ func (n *Node) admitMedia(s transport.MediaSession) {
 		_ = s.Close()
 		return
 	}
-	// level-2 session caps (per node and per source IP): bound what a flood
-	// of PoW-valid identities can pin — goroutines, pooled buffers, the
-	// consent callback's attention. Reserved before consent so a flood cannot
-	// spam the application's callback either.
-	host := mediaHost(s.RemoteAddr(), n.ipAddressed)
-	if !n.mediaSlots.reserve(host) {
+	// level-2 session caps (per node and per authenticated peer identity): bound
+	// what a flood of PoW-valid identities can pin — goroutines, pooled buffers, the
+	// consent callback's attention. Reserved before consent so a flood cannot spam
+	// the application's callback either. The per-peer key is the NodeID, not the
+	// transport IP, so many distinct peers reaching us through one relay (sharing its
+	// IP) are not collapsed into a single per-relay cap.
+	peer := s.Remote().String()
+	if !n.mediaSlots.reserve(peer) {
 		n.stats.mediaCap.Add(1)
 		_ = s.Close()
 		return
 	}
 	// The watcher releases the slot when the session ends, however it ends.
-	n.watchMedia(s, func() { n.mediaSlots.release(host) })
+	n.watchMedia(s, func() { n.mediaSlots.release(peer) })
 	// level-2 consent: nil gate = refuse all, secure by default.
 	if n.mediaConsent == nil || !n.mediaConsent(s.Remote()) {
 		n.stats.mediaConsent.Add(1)
@@ -1514,7 +1628,13 @@ func (n *Node) watchMedia(s transport.MediaSession, release func()) {
 // reach both this node and, over its own edge, the callee). It returns the relay's
 // NodeID and whether one was found.
 func (n *Node) pickRelay(target kad.ID) (kad.ID, bool) {
-	for _, le := range n.e.Conns(nil) {
+	n.relayBufMu.Lock()
+	defer n.relayBufMu.Unlock()
+	// Reuse the snapshot buffer instead of allocating one per call. The snapshot is
+	// taken under the edges lock (released inside Conns), then knowledge.Get runs
+	// outside it — keeping the edges→knowledge lock order the rest of the node uses.
+	n.relayBuf = n.e.Conns(n.relayBuf[:0])
+	for _, le := range n.relayBuf {
 		if le.ID == target {
 			continue
 		}
@@ -2030,6 +2150,11 @@ func (n *Node) drainProbes(now time.Time, pending map[kad.ID]bool, req chan<- di
 		}
 		c, ok := n.k.Get(id)
 		if !ok || len(c.Addrs) == 0 {
+			// An eviction candidate we cannot dial cannot be probed for liveness, so
+			// confirm it dead: it is evicted and a freshest fitting (keyed, dialable)
+			// newcomer is promoted in its place. Leaving it would pin a bucket slot
+			// with an undialable incumbent and starve real replacements.
+			n.k.Confirm(id, false, now)
 			continue
 		}
 		if pending[id] {
@@ -2125,7 +2250,10 @@ func (n *Node) fill(now time.Time, backoff map[kad.ID]backoffState, pending map[
 // bound and is dropped — the maintenance-side failure detector that complements the
 // transport's own signal.
 func (n *Node) keepaliveAndReap(now time.Time, m Maintenance) {
-	var buf [routing.TargetEdges * 2]routing.LiveEdge
+	// Sized for the whole live set — self-maintained edges (~TargetEdges) plus up to
+	// InboundCap peer-initiated ones — so the scan never overflows to the heap. The old
+	// 2*TargetEdges (128) sat below InboundCap (256).
+	var buf [routing.TargetEdges + routing.InboundCap]routing.LiveEdge
 	for _, le := range n.e.Idle(now, m.DeadSibling, m.DeadFinger, buf[:0]) {
 		n.dropEdge(le.ID)
 	}
@@ -2171,7 +2299,10 @@ func (n *Node) fanout(edges []routing.LiveEdge, src *transport.Packet, wait bool
 		p.SetLen(len(b))
 		send := func() {
 			defer p.Release()
-			if le.Conn.Send(p) != nil {
+			// Bounded send: a stalled neighbour must not wedge the fan-out. With wait=true
+			// (graceful leave at shutdown) an unbounded Send would hang wg.Wait() forever
+			// and Run would never return; the per-send bound caps the whole fan-out.
+			if n.forwardSend(le.Conn, p) != nil {
 				n.dropEdge(le.ID)
 			}
 		}
@@ -2251,7 +2382,7 @@ func (n *Node) siblingExchange() {
 // the edge and replace it proactively instead of waiting for a timeout. Best-effort:
 // it runs as the node stops, so a failed send (the edge already gone) is ignored.
 func (n *Node) gracefulLeave() {
-	var buf [routing.TargetEdges * 2]routing.LiveEdge
+	var buf [routing.TargetEdges + routing.InboundCap]routing.LiveEdge
 	conns := n.e.Conns(buf[:0])
 	if len(conns) == 0 {
 		return

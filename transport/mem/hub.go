@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/udisondev/nodenet/kad"
 	"github.com/udisondev/nodenet/transport"
@@ -18,13 +19,14 @@ const defaultInbound = 16
 // "the network". It resolves Dial targets and is safe for concurrent use. It has
 // no dependence on wall-clock or real I/O.
 type Hub struct {
-	mu      sync.Mutex
-	byID    map[kad.ID]*memTransport
-	byAddr  map[transport.Addr]*memTransport
-	inbuf   int
-	blocked map[[2]kad.ID]bool       // partitioned NodeID pairs; traffic between them is blackholed
-	links   map[[2]kad.ID]*linkModel // DIRECTED media link models, keyed (from, to)
-	noMedia map[kad.ID]bool          // nodes flagged as not supporting media (older peers)
+	mu        sync.Mutex
+	byID      map[kad.ID]*memTransport
+	byAddr    map[transport.Addr]*memTransport
+	inbuf     int
+	sendBound time.Duration            // >0 caps a blocked deliver (mirrors QUIC's send deadline); 0 = unbounded
+	blocked   map[[2]kad.ID]bool       // partitioned NodeID pairs; traffic between them is blackholed
+	links     map[[2]kad.ID]*linkModel // DIRECTED media link models, keyed (from, to)
+	noMedia   map[kad.ID]bool          // nodes flagged as not supporting media (older peers)
 }
 
 // HubOption configures a Hub at construction.
@@ -35,6 +37,16 @@ type HubOption func(*Hub)
 // until a receiver takes the frame.
 func WithInboundBuffer(n int) HubOption {
 	return func(h *Hub) { h.inbuf = n }
+}
+
+// WithSendBound caps how long a Send may block on a backpressured (full,
+// undrained) inbound channel before it returns ErrConnClosed, mirroring the QUIC
+// transport's send deadline so a stalled neighbour cannot wedge a sender forever.
+// The default is 0 (unbounded — the historical behaviour). Under testing/synctest
+// the bound runs on the fake clock, so it stays deterministic. The fast path (room
+// in the channel) never arms a timer, so a set bound costs nothing when traffic flows.
+func WithSendBound(d time.Duration) HubOption {
+	return func(h *Hub) { h.sendBound = d }
 }
 
 // NewHub creates an empty Hub.
@@ -87,12 +99,27 @@ func (h *Hub) lookup(addr transport.Addr) (*memTransport, bool) {
 }
 
 // remove deregisters a transport (called from its Close), so a later Dial to its
-// address returns ErrNoRoute.
+// address returns ErrNoRoute. It also drops every per-node soft state the Hub holds
+// for the departing identity — partitions, directed link profiles, the media-support
+// flag — so a re-registration of the same NodeID starts from a clean slate instead of
+// silently inheriting a dead node's partition or link model. remove runs only on
+// Close, so the linear scans of the (small) partition/link maps are off any hot path.
 func (h *Hub) remove(t *memTransport) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.byID, t.id)
 	delete(h.byAddr, t.addr)
+	delete(h.noMedia, t.id)
+	for k := range h.blocked {
+		if k[0] == t.id || k[1] == t.id {
+			delete(h.blocked, k)
+		}
+	}
+	for k := range h.links {
+		if k[0] == t.id || k[1] == t.id {
+			delete(h.links, k)
+		}
+	}
 }
 
 // Partition blackholes all communication between NodeIDs a and b in BOTH

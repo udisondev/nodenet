@@ -19,14 +19,15 @@ import (
 // so the node maintenance loop's ping/pong is the single source of liveness truth
 // (and the basis for reflexive learning and NAT keepalive).
 type config struct {
-	idleTimeout      time.Duration
-	keepAlivePeriod  time.Duration
-	handshakeTimeout time.Duration
-	sendDeadline     time.Duration
-	inboundBuffer    int
-	maxInbound       int                            // global cap on concurrent inbound connections (level-2 self-protection)
-	maxInboundPerIP  int                            // cap on concurrent inbound connections from one source IP
-	relaySocket      func() (net.PacketConn, error) // factory for relay allocation sockets; nil → bind UDP
+	idleTimeout       time.Duration
+	keepAlivePeriod   time.Duration
+	handshakeTimeout  time.Duration
+	sendDeadline      time.Duration
+	firstFrameTimeout time.Duration // bound for a just-accepted inbound to open its stream and send a first frame
+	inboundBuffer     int
+	maxInbound        int                            // global cap on concurrent inbound connections (level-2 self-protection)
+	maxInboundPerIP   int                            // cap on concurrent inbound connections from one source IP
+	relaySocket       func() (net.PacketConn, error) // factory for relay allocation sockets; nil → bind UDP
 }
 
 func defaultConfig() config {
@@ -40,8 +41,17 @@ func defaultConfig() config {
 		// whole router. A write that cannot drain within this window tears the edge down
 		// and the overlay repairs via disjoint paths and re-dial. Generous, so only a
 		// genuinely stuck edge trips it, not transient congestion on a healthy link.
-		sendDeadline:  5 * time.Second,
-		inboundBuffer: 16, // matches transport/mem's default
+		sendDeadline: 5 * time.Second,
+		// firstFrameTimeout bounds the window a just-accepted inbound connection has to
+		// open its bidi stream and deliver its first frame. A peer that finishes the cheap
+		// (non-PoW) TLS handshake but then stays silent — never opening a stream, or
+		// opening one and sending nothing — would otherwise pin an admission slot until the
+		// idle timeout (5 min, reset by its own QUIC keepalives), a free slowloris. After
+		// the first frame the bound is cleared, so a healthy long-lived edge with sparse
+		// traffic is never reaped by it (overlay keepalive governs liveness from then on).
+		// Level-2 self-protection (on by default; only applies to inbound connections).
+		firstFrameTimeout: 30 * time.Second,
+		inboundBuffer:     16, // matches transport/mem's default
 		// Inbound admission caps. TLS authenticates a peer to its NodeID but does NOT cost
 		// it any proof-of-work (PoW is checked a layer up, on the first frame), so the cheap
 		// handshake alone is not a barrier: an adversary minting throwaway identities can
@@ -91,6 +101,16 @@ func WithMaxInbound(n int) Option { return func(c *config) { c.maxInbound = n } 
 // IP, so one host (or one NAT) cannot consume every global slot. A non-positive value
 // disables the per-IP cap. The default is 32.
 func WithMaxInboundPerIP(n int) Option { return func(c *config) { c.maxInboundPerIP = n } }
+
+// WithFirstFrameTimeout bounds how long a just-accepted inbound connection has to open
+// its bidi stream and deliver a first frame before it is dropped and its admission slot
+// freed — the level-2 backstop against a slowloris that completes the cheap handshake
+// and then parks silently. It applies only to inbound (accepted) connections, and only
+// until their first frame; outbound (dialed) edges and established edges are unaffected.
+// A non-positive value disables the bound. The default is 30s.
+func WithFirstFrameTimeout(d time.Duration) Option {
+	return func(c *config) { c.firstFrameTimeout = d }
+}
 
 // WithRelaySocketFactory sets how a relay volunteer allocates the extra sockets a relay
 // session splices over. The default binds fresh UDP sockets on the transport's host;
@@ -145,9 +165,11 @@ func ListenPacketConn(id *identity.Identity, pc net.PacketConn, opts ...Option) 
 	// overlay edge a foreign dialer may negotiate them, but our overlay code
 	// never reads datagrams, so anything it sends dies in quic-go's small
 	// bounded receive queue — wasted bytes for the sender, no resource growth
-	// here. Per RFC 9000 a media session's effective idle timeout is the min
-	// of both ends — the media dialer's 10 s — regardless of the listener's
-	// overlay-sized value here.
+	// here. A media session's effective QUIC idle is the min of both ends, so an
+	// honest dialer's 10 s governs — but a hostile dialer could advertise a long
+	// (or disabled) idle and park an accepted session at this overlay-sized value.
+	// An accepted media session therefore runs its own idle reaper (see idleReap),
+	// not trusting the peer's advertised idle.
 	qconf := &quicgo.Config{
 		MaxIdleTimeout:       cfg.idleTimeout,
 		KeepAlivePeriod:      cfg.keepAlivePeriod,
@@ -157,6 +179,14 @@ func ListenPacketConn(id *identity.Identity, pc net.PacketConn, opts ...Option) 
 	lconf := qconf.Clone()
 	lconf.EnableDatagrams = true
 	lconf.MaxIncomingUniStreams = maxMediaUniStreams
+	// On an overlay edge WE dialed, the peer must not open anything: we open the one
+	// bidi stream and both directions ride it. Deny the peer any incoming stream
+	// (negative = none in quic-go) so it cannot stuff data into extra streams that
+	// quic-go would buffer past the per-frame PoW gate. The listener (lconf) still
+	// accepts the peer's single overlay bidi and media uni-streams; its extra streams
+	// are reset by the accept path's drain instead (handleAccepted).
+	qconf.MaxIncomingStreams = -1
+	qconf.MaxIncomingUniStreams = -1
 	tr := &quicgo.Transport{Conn: pc}
 	ln, err := tr.Listen(listenerTLSConfig(tlsConf), lconf)
 	if err != nil {
@@ -184,9 +214,10 @@ func ListenPacketConn(id *identity.Identity, pc net.PacketConn, opts ...Option) 
 		relaySlots:   make(chan struct{}, maxRelaySessions),
 		inboundSlots: inboundSlots,
 		perIP:        make(map[netip.Addr]int),
-		maxPerIP:     cfg.maxInboundPerIP,
-		sendDeadline: cfg.sendDeadline,
-		tr:           tr,
+		maxPerIP:          cfg.maxInboundPerIP,
+		sendDeadline:      cfg.sendDeadline,
+		firstFrameTimeout: cfg.firstFrameTimeout,
+		tr:                tr,
 		ln:           ln,
 		tlsConf:      tlsConf,
 		qconf:        qconf,
@@ -247,7 +278,9 @@ func (t *quicTransport) Dial(ctx context.Context, remoteID kad.ID, addr transpor
 		return nil, fmt.Errorf("%w: open stream to %s: %v", transport.ErrNoRoute, addr.Endpoint, err)
 	}
 
-	c := newQuicConn(t, remote, qconn, str)
+	// Outbound: no first-frame read deadline — we opened the stream and the peer may
+	// legitimately stay quiet; the overlay keepalive governs this edge's liveness.
+	c := newQuicConn(t, remote, qconn, str, 0)
 	if !t.registerConn(c) {
 		_ = qconn.CloseWithError(appCodeNormal, "")
 		return nil, transport.ErrConnClosed

@@ -1,6 +1,9 @@
 package routing
 
 import (
+	"encoding/binary"
+	"math/rand/v2"
+	"sync"
 	"testing"
 	"time"
 
@@ -171,6 +174,148 @@ func TestEdgesClosest(t *testing.T) {
 			t.Fatalf("closer edge %x excluded", id)
 		}
 	}
+}
+
+// TestReclassifyMatchesBruteForce: the O(n·Siblings) sibling selection must mark
+// exactly the same edges as the original all-pairs O(n²) rule — the Siblings edges
+// closest to self — for any live set. It cross-checks against a brute-force count.
+func TestReclassifyMatchesBruteForce(t *testing.T) {
+	var self kad.ID
+	e := NewEdges(self, nil)
+	const n = 40 // > Siblings, spread across buckets
+	var ids []kad.ID
+	for i := range n {
+		id := idInBucket(self, 1+i%30, i+1)
+		add(t, e, id, true, 0, "")
+		ids = append(ids, id)
+	}
+
+	gotSiblings := 0
+	for _, id := range ids {
+		// Brute force: id is a sibling iff fewer than Siblings other edges are closer
+		// to self.
+		closer := 0
+		for _, other := range ids {
+			if other != id && kad.DistanceCmp(self, other, id) < 0 {
+				closer++
+			}
+		}
+		wantSibling := closer < Siblings
+		if got := isSibling(e, id); got != wantSibling {
+			t.Fatalf("edge %x: isSibling=%v, brute-force want %v", id[:4], got, wantSibling)
+		}
+		if wantSibling {
+			gotSiblings++
+		}
+	}
+	if gotSiblings != Siblings {
+		t.Fatalf("classified %d siblings, want exactly %d", gotSiblings, Siblings)
+	}
+}
+
+// TestTouchUnderConcurrentReaders: Touch now runs under a read lock plus an atomic
+// store, so it must be race-free against the concurrent RLock readers (Idle,
+// Closest, Siblings). Run under -race to catch a regression.
+func TestTouchUnderConcurrentReaders(t *testing.T) {
+	var self kad.ID
+	e := NewEdges(self, nil)
+	ids := edgeIDs(t, e, self, 4)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for range 4 {
+		wg.Go(func() {
+			now := t0
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				for _, id := range ids {
+					e.Touch(id, now)
+				}
+				now = now.Add(time.Second)
+			}
+		})
+	}
+	for range 4 {
+		wg.Go(func() {
+			buf := make([]LiveEdge, 0, len(ids))
+			tgt := idInBucket(self, 5, 1)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				e.Idle(t0.Add(30*time.Second), 10*time.Second, 60*time.Second, buf)
+				e.Closest(tgt, 3, buf)
+				e.Siblings(buf)
+			}
+		})
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
+// TestEdgesClosestMatchesFullScan: the CPL-indexed Closest must return exactly what
+// a brute-force full scan would, element-by-element, for many random edge sets and
+// targets — guarding the bucket-skip early-stop against ever dropping a closer edge.
+func TestEdgesClosestMatchesFullScan(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	randID := func() kad.ID {
+		var id kad.ID
+		for o := 0; o < kad.IDLen; o += 8 {
+			binary.BigEndian.PutUint64(id[o:], rng.Uint64())
+		}
+		return id
+	}
+	for trial := range 200 {
+		self := randID()
+		e := NewEdges(self, nil)
+		ids := make([]kad.ID, 0, 64)
+		for range 1 + trial%64 {
+			id := randID()
+			if id == self {
+				continue
+			}
+			if err := e.AddEdge(fakeConn{id: id}, true, 0, t0); err != nil {
+				continue // dup
+			}
+			ids = append(ids, id)
+		}
+		// Drop a few at random so the bucket index exercises removal too.
+		for i := 0; i < len(ids)/4; i++ {
+			e.RemoveEdge(ids[i])
+		}
+
+		for _, n := range []int{1, 3, 8} {
+			target := randID()
+			got := e.Closest(target, n, make([]LiveEdge, 0, n))
+			want := bruteClosest(e, target, n)
+			if len(got) != len(want) {
+				t.Fatalf("trial %d n=%d: len(got)=%d want %d", trial, n, len(got), len(want))
+			}
+			for i := range got {
+				if got[i].ID != want[i].ID {
+					t.Fatalf("trial %d n=%d pos %d: got %x want %x", trial, n, i, got[i].ID[:4], want[i].ID[:4])
+				}
+			}
+		}
+	}
+}
+
+// bruteClosest is the reference: a flat scan of every live edge, kept n-closest.
+func bruteClosest(e *Edges, target kad.ID, n int) []LiveEdge {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	var buf []LiveEdge
+	for _, ed := range e.list {
+		buf = insertClosestEdge(buf, LiveEdge{ID: ed.id, Conn: ed.conn}, target, n)
+	}
+	return buf
 }
 
 func TestStatusBands(t *testing.T) {

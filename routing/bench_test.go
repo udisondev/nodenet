@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"testing"
 	"time"
@@ -67,6 +68,52 @@ func BenchmarkEdgesClosest(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		e.Closest(target, 8, buf)
+	}
+}
+
+// BenchmarkEdgesClosestScale measures next-hop selection as the live set grows
+// toward its bound (out + InboundCap). Before the CPL bucket index Closest scanned
+// the whole set, so ns/op rose roughly linearly with N; the index makes it walk only
+// the closeness tiers a next-hop can fall in, so the growth flattens. 0 allocs/op in
+// every case (pre-sized buffer).
+func BenchmarkEdgesClosestScale(b *testing.B) {
+	for _, n := range []int{1, 64, 256, 320} {
+		b.Run(fmt.Sprintf("N=%d", n), func(b *testing.B) {
+			var self kad.ID
+			rng := rand.New(rand.NewPCG(42, uint64(n)))
+			e := NewEdges(self, nil)
+			for range n {
+				e.AddEdge(fakeConn{id: randID(rng)}, true, 0, t0)
+			}
+			target := randID(rng)
+			buf := make([]LiveEdge, 0, 8)
+			b.ReportAllocs()
+			for b.Loop() {
+				e.Closest(target, 8, buf)
+			}
+		})
+	}
+}
+
+// BenchmarkReclassifyAddRemove measures the role reclassification cost on churn at
+// growing live-set sizes. The selection is O(n·Siblings) (was O(n²)), so ns/op grows
+// far slower than quadratically as N rises.
+func BenchmarkReclassifyAddRemove(b *testing.B) {
+	for _, n := range []int{64, 256} {
+		b.Run(fmt.Sprintf("N=%d", n), func(b *testing.B) {
+			var self kad.ID
+			rng := rand.New(rand.NewPCG(7, uint64(n)))
+			e := NewEdges(self, nil)
+			for range n {
+				e.AddEdge(fakeConn{id: randID(rng)}, true, 0, t0)
+			}
+			churn := fakeConn{id: randID(rng)}
+			b.ReportAllocs()
+			for b.Loop() {
+				e.AddEdge(churn, true, 0, t0)
+				e.RemoveEdge(churn.Remote())
+			}
+		})
 	}
 }
 

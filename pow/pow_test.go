@@ -3,7 +3,10 @@ package pow
 import (
 	"context"
 	"errors"
+	"io"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/udisondev/nodenet/identity"
 	"github.com/udisondev/nodenet/kad"
@@ -103,6 +106,49 @@ func TestSolveCancel(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Solve(cancelled ctx) error = %v, want context.Canceled", err)
 	}
+}
+
+// TestSolveCancelBlockingReader: Solve must honour ctx cancellation even when the
+// entropy source blocks forever. A reader stuck inside Read holds the shared rand
+// lock; before the fix Solve parked on wg.Wait() and never returned, hanging the
+// caller and leaking every worker. After the fix Solve races wg.Wait() against
+// ctx.Done() and returns ctx.Err() on cancel.
+func TestSolveCancelBlockingReader(t *testing.T) {
+	br := &blockingReader{inRead: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := Solve(ctx, br, 16)
+		errc <- err
+	}()
+
+	// Wait until at least one worker is parked inside Read, then cancel.
+	<-br.inRead
+	cancel()
+
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Solve(blocking reader, cancelled) error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Solve hung: did not return after ctx cancel with a blocking reader")
+	}
+}
+
+// blockingReader blocks in Read until released; it signals (once) that a reader
+// has entered Read so the test can cancel deterministically.
+type blockingReader struct {
+	inRead  chan struct{}
+	once    sync.Once
+	release chan struct{}
+}
+
+func (b *blockingReader) Read(p []byte) (int, error) {
+	b.once.Do(func() { close(b.inRead) })
+	<-b.release // never released: blocks forever
+	return 0, io.EOF
 }
 
 func TestSolveReadError(t *testing.T) {

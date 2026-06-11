@@ -4,11 +4,13 @@ import (
 	"encoding/binary"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/udisondev/nodenet/kad"
 	"github.com/udisondev/nodenet/pow"
+	"github.com/udisondev/nodenet/transport"
 )
 
 // SubnetCap is the most entries one subnet (/24 or /64) may hold across the whole
@@ -140,9 +142,16 @@ func (k *Knowledge) Observe(c Contact, now time.Time) (outcome ObserveOutcome, p
 
 	// level-2 admission-PoW: a newcomer's NodeID must clear the difficulty before it
 	// may enter the table, so a sub-threshold Sybil identity is neither stored nor
-	// later handed out by Closest. The NodeID self-certifies its work (leading zeros),
-	// so this needs no ed_pub. An already-admitted contact (the refresh branch above)
-	// was vetted on entry and is not re-checked, keeping the refresh hot path free.
+	// later handed out by Closest. Leading zeros only certify work when the NodeID is
+	// bound to an ed_pub that hashes to it: a keyless ID-only hint could be minted with
+	// any leading-zero prefix at zero cost, so when PoW is enabled a keyless newcomer is
+	// refused — its key (and with it any reachable address) is learned later through a
+	// keyed observation, which is when it earns a slot. An already-admitted contact (the
+	// refresh branch above) was vetted on entry and is not re-checked, keeping the
+	// refresh hot path free.
+	if k.dmin > 0 && c.EdPub == [32]byte{} {
+		return ObserveRejected, kad.ID{}
+	}
 	if !pow.Satisfies(c.ID, k.dmin) {
 		return ObserveRejected, kad.ID{}
 	}
@@ -354,6 +363,7 @@ func (k *Knowledge) deriveSubnet(c *Contact) {
 
 // admit prepends c as the most-recently-seen entry and counts its subnet.
 func (k *Knowledge) admit(b *bucket, c Contact) {
+	c.Addrs = cloneAddrs(c.Addrs)
 	b.entries = slices.Insert(b.entries, 0, c)
 	if c.hasSubnet {
 		k.subnetCnt[c.subnet]++
@@ -361,9 +371,26 @@ func (k *Knowledge) admit(b *bucket, c Contact) {
 	k.n++
 }
 
+// cloneAddrs returns a dense, independently-backed copy of in, breaking any aliasing
+// into a caller's buffer. DecodeNeighbors hands back contacts whose addresses share
+// one backing slice and one backing string across the whole answer; storing such a
+// contact as-is would pin the entire response. Cloning at the point a contact lands
+// in long-lived storage keeps a retained contact's footprint to its own addresses.
+func cloneAddrs(in []transport.Addr) []transport.Addr {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]transport.Addr, len(in))
+	for i, a := range in {
+		out[i] = transport.Addr{Net: strings.Clone(a.Net), Endpoint: strings.Clone(a.Endpoint)}
+	}
+	return out
+}
+
 // stashReplace prepends c into the bounded replacement cache (deduping by ID),
 // dropping the least-recently-seen candidate past capacity.
 func (k *Knowledge) stashReplace(b *bucket, c Contact) {
+	c.Addrs = cloneAddrs(c.Addrs)
 	if i := indexOf(b.replace, c.ID); i >= 0 {
 		moveToFront(b.replace, i, c)
 		return
@@ -468,7 +495,9 @@ func mergeLearned(e *Contact, c Contact) {
 		e.Caps = c.Caps
 	}
 	if len(c.Addrs) > 0 {
-		e.Addrs = c.Addrs
+		// Clone so a stored entry owns its address backing instead of pinning the
+		// shared decode buffer of a whole neighbours answer.
+		e.Addrs = cloneAddrs(c.Addrs)
 	}
 }
 

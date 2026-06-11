@@ -12,17 +12,18 @@ import (
 func BenchmarkReplayCacheRecordSaturated(b *testing.B) {
 	cache := NewReplayCache(time.Minute)
 	now := time.Unix(1_700_000_000, 0) // fixed clock: the sweep never re-triggers
+	exp := now.Add(time.Minute).UnixNano()
 	var k [ephPubLen]byte
 	for i := range maxReplayEntries {
 		binary.BigEndian.PutUint64(k[8:], uint64(i))
-		cache.record(k, now)
+		cache.record(k, now, exp)
 	}
 	k[0] = 0xff // distinct namespace from the fill keys
 	var n uint64
 	for b.Loop() {
 		n++
 		binary.BigEndian.PutUint64(k[8:], n)
-		if !cache.record(k, now) {
+		if !cache.record(k, now, exp) {
 			b.Fatal("fresh key was not recorded")
 		}
 	}
@@ -55,10 +56,10 @@ func TestReplayCacheSaturationStillDedups(t *testing.T) {
 	probe[0] = 0xff // distinct from every synthetic key (whose byte 0 is always zero)
 	probe[ephPubLen-1] = 0xff
 
-	if !cache.record(probe, now) {
+	if !cache.record(probe, now, exp) {
 		t.Fatal("saturated cache did not record a fresh box (silent window-only downgrade)")
 	}
-	if cache.record(probe, now) {
+	if cache.record(probe, now, exp) {
 		t.Fatal("replay of a box recorded under saturation was accepted")
 	}
 	if total := len(cache.cur) + len(cache.prev); total > maxReplayEntries {
@@ -83,14 +84,14 @@ func TestReplayCacheRotationKeepsRecentKeys(t *testing.T) {
 	}
 	var witness [ephPubLen]byte
 	witness[0] = 0xee
-	if !cache.record(witness, now) {
+	if !cache.record(witness, now, exp) {
 		t.Fatal("witness was not recorded")
 	}
 
 	// The next record rotates: the generation holding the witness becomes prev.
 	var trigger [ephPubLen]byte
 	trigger[0] = 0xff
-	if !cache.record(trigger, now) {
+	if !cache.record(trigger, now, exp) {
 		t.Fatal("trigger was not recorded")
 	}
 	if _, ok := cache.prev[witness]; !ok {
@@ -98,7 +99,7 @@ func TestReplayCacheRotationKeepsRecentKeys(t *testing.T) {
 	}
 
 	// The witness still dedups from the previous generation.
-	if cache.record(witness, now) {
+	if cache.record(witness, now, exp) {
 		t.Fatal("replay of a key recorded just before rotation was accepted")
 	}
 }

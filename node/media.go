@@ -1,10 +1,7 @@
 package node
 
 import (
-	"net"
 	"sync"
-
-	"github.com/udisondev/nodenet/transport"
 )
 
 // Media-session admission policy. The session itself is transport business
@@ -21,10 +18,12 @@ const (
 	// Outbound sessions are this node's own doing and are not capped here.
 	maxMediaSessions = 16
 
-	// maxMediaPerIP caps admitted inbound sessions per source IP, so one host
-	// cannot hold every slot. Inert on a transport whose endpoints carry no
-	// IP (the in-memory one), like the other subnet-keyed caps.
-	maxMediaPerIP = 4
+	// maxMediaPerPeer caps admitted inbound sessions per authenticated source
+	// identity (NodeID), so one peer cannot hold every slot. Keying on the NodeID
+	// rather than the transport IP keeps the cap meaningful when many distinct
+	// peers reach this node through one relay (they share the relay's IP but not
+	// their NodeID) — a per-IP key would there collapse into a per-relay cap.
+	maxMediaPerPeer = 4
 
 	// mediaInBuffer is the depth of the gated inbound-session channel the
 	// application reads (Node.InboundMedia). An admitted session the
@@ -34,66 +33,50 @@ const (
 )
 
 // mediaSlots is the bounded accounting of admitted inbound media sessions:
-// a node-wide count and a per-host count. Reserve before announcing a session,
+// a node-wide count and a per-identity count. Reserve before announcing a session,
 // release when it ends; both are cheap and mutex-guarded (the media gate and
 // the per-session watchers run on different goroutines).
 type mediaSlots struct {
-	mu    sync.Mutex
-	count int
-	perIP map[string]int
+	mu      sync.Mutex
+	count   int
+	perPeer map[string]int // keyed by the authenticated NodeID, not the transport IP
 }
 
 func newMediaSlots() *mediaSlots {
-	return &mediaSlots{perIP: make(map[string]int)}
+	return &mediaSlots{perPeer: make(map[string]int)}
 }
 
-// reserve takes one slot for a session from host (empty host = no per-IP
-// accounting, the non-IP-transport case). It reports false — and takes
-// nothing — past either cap. level-2 self-protection.
-func (m *mediaSlots) reserve(host string) bool {
+// reserve takes one slot for a session from peer (the authenticated NodeID key; an
+// empty key disables per-peer accounting). It reports false — and takes nothing —
+// past either cap. level-2 self-protection.
+func (m *mediaSlots) reserve(peer string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.count >= maxMediaSessions {
 		return false
 	}
-	if host != "" && m.perIP[host] >= maxMediaPerIP {
+	if peer != "" && m.perPeer[peer] >= maxMediaPerPeer {
 		return false
 	}
 	m.count++
-	if host != "" {
-		m.perIP[host]++
+	if peer != "" {
+		m.perPeer[peer]++
 	}
 	return true
 }
 
 // release returns a reserved slot. Call it exactly once per successful
 // reserve, when the session ends.
-func (m *mediaSlots) release(host string) {
+func (m *mediaSlots) release(peer string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.count--
-	if host == "" {
+	if peer == "" {
 		return
 	}
-	if m.perIP[host] <= 1 {
-		delete(m.perIP, host)
+	if m.perPeer[peer] <= 1 {
+		delete(m.perPeer, peer)
 	} else {
-		m.perIP[host]--
+		m.perPeer[peer]--
 	}
-}
-
-// mediaHost extracts the per-IP accounting key from a session's remote
-// address: the host part of an ip:port endpoint. ipOnly marks an IP-based
-// transport (transport.IPAddressed); on any other transport — or for an
-// endpoint that does not parse — the key is empty and the per-IP cap stays
-// inert, exactly like the subnet-diversity caps on the in-memory transport.
-func mediaHost(addr transport.Addr, ipOnly bool) string {
-	if !ipOnly {
-		return ""
-	}
-	host, _, err := net.SplitHostPort(addr.Endpoint)
-	if err != nil {
-		return ""
-	}
-	return host
 }

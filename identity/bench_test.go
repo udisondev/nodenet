@@ -19,6 +19,18 @@ func BenchmarkFromSeed(b *testing.B) {
 	}
 }
 
+// BenchmarkIDFromSeed measures the NodeID-only derivation used by the PoW grind:
+// HKDF extract + the Ed25519 expand and key construction, skipping the X25519
+// scalar-mult. It should be markedly cheaper than BenchmarkFromSeed, which is the
+// whole point — the grind runs this ~2^d times and FromSeed only once.
+func BenchmarkIDFromSeed(b *testing.B) {
+	seed := fixedSeed()
+	b.ReportAllocs()
+	for b.Loop() {
+		IDFromSeed(seed)
+	}
+}
+
 // BenchmarkSign measures one Ed25519 signature.
 func BenchmarkSign(b *testing.B) {
 	id := FromSeed(fixedSeed())

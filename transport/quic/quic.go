@@ -66,8 +66,9 @@ type quicTransport struct {
 	relaySocket  func() (net.PacketConn, error)
 	relaySlots   chan struct{} // bounded semaphore: one token per live relay session, cap maxRelaySessions
 	inboundSlots chan struct{} // bounded semaphore: one token per admitted inbound connection; nil disables the global cap
-	maxPerIP     int           // cap on concurrent inbound connections from one source IP; ≤0 disables it
-	sendDeadline time.Duration // per-frame write bound; a stuck edge is torn down rather than stalling the loop
+	maxPerIP          int           // cap on concurrent inbound connections from one source IP; ≤0 disables it
+	sendDeadline      time.Duration // per-frame write bound; a stuck edge is torn down rather than stalling the loop
+	firstFrameTimeout time.Duration // inbound-only bound to open a stream and send a first frame; ≤0 disables it
 	tr           *quicgo.Transport
 	ln           *quicgo.Listener
 	tlsConf      *tls.Config
@@ -206,17 +207,33 @@ func (t *quicTransport) handleAccepted(ctx context.Context, qconn *quicgo.Conn) 
 		_ = qconn.CloseWithError(appCodeNormal, "")
 		return
 	}
-	str, err := qconn.AcceptStream(ctx)
+	// Bound the wait for the peer to open its bidi stream: a connection that finished
+	// the handshake but never opens a stream would otherwise block here until the idle
+	// timeout, pinning its admission slot. Inbound-only, level-2 self-protection.
+	actx := ctx
+	if t.firstFrameTimeout > 0 {
+		var cancel context.CancelFunc
+		actx, cancel = context.WithTimeout(ctx, t.firstFrameTimeout)
+		defer cancel()
+	}
+	str, err := qconn.AcceptStream(actx)
 	if err != nil {
 		_ = qconn.CloseWithError(appCodeNormal, "")
 		return
 	}
-	c := newQuicConn(t, remote, qconn, str)
+	c := newQuicConn(t, remote, qconn, str, t.firstFrameTimeout)
 	if !t.registerConn(c) {
 		_ = qconn.CloseWithError(appCodeNormal, "")
 		return
 	}
 	defer t.wg.Done() // pairs with the read-loop slot registerConn reserved
+	// Drain any extra stream the peer opens on this accepted overlay edge (extra bidi
+	// or any uni — the overlay uses only the one bidi above). The wg counter is ≥1
+	// here (the read-loop slot), so these Adds cannot race Close's Wait at zero; both
+	// goroutines exit when the connection or transport closes.
+	t.wg.Add(2)
+	go func() { defer t.wg.Done(); c.drainExtraStreams(ctx, true) }()
+	go func() { defer t.wg.Done(); c.drainExtraStreams(ctx, false) }()
 	c.readLoop()
 }
 

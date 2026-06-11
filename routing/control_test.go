@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/udisondev/nodenet/kad"
 	"github.com/udisondev/nodenet/transport"
 	"github.com/udisondev/nodenet/wire"
 )
@@ -215,6 +216,48 @@ func TestDecodeNeighborsShortBuffer(t *testing.T) {
 	if _, err := DecodeNeighbors(nil); !errors.Is(err, wire.ErrShortBuffer) {
 		t.Fatalf("DecodeNeighbors(nil) = %v, want ErrShortBuffer", err)
 	}
+}
+
+// TestDecodeNeighborsBoundsAddrAmplification: an answer that declares one contact
+// carrying a flood of empty addresses must be refused, not decoded. Each empty
+// address is two wire bytes but expands to a 32-byte transport.Addr plus scan
+// bookkeeping (~32x); the buffer-only bound let a 64 KiB frame drive ~2 MB. The
+// absolute per-answer address cap closes it.
+func TestDecodeNeighborsBoundsAddrAmplification(t *testing.T) {
+	const naddrs = maxNeighborsAddrs + 1024 // over the cap, but small on the wire
+	var b []byte
+	b = appendUvarint(b, 1) // one contact
+	b = append(b, make([]byte, 3*kad.IDLen+4)...)
+	b = appendUvarint(b, naddrs)
+	for range naddrs {
+		b = append(b, 0x00, 0x00) // empty net, empty endpoint
+	}
+	if _, err := DecodeNeighbors(b); !errors.Is(err, wire.ErrShortBuffer) {
+		t.Fatalf("DecodeNeighbors(flood of empty addrs) err = %v, want ErrShortBuffer", err)
+	}
+}
+
+// TestDecodeNeighborsRejectsAbsurdContactCount: a legitimate answer holds at most
+// Siblings+1 contacts; a larger declared count is hostile and must be refused
+// before the per-contact allocation.
+func TestDecodeNeighborsRejectsAbsurdContactCount(t *testing.T) {
+	const ncontacts = maxNeighborsContacts + 1
+	var b []byte
+	b = appendUvarint(b, ncontacts)
+	for range ncontacts {
+		b = append(b, make([]byte, 3*kad.IDLen+4)...) // id+keys+caps
+		b = appendUvarint(b, 0)                        // zero addresses
+	}
+	if _, err := DecodeNeighbors(b); !errors.Is(err, wire.ErrShortBuffer) {
+		t.Fatalf("DecodeNeighbors(%d contacts) err = %v, want ErrShortBuffer", ncontacts, err)
+	}
+}
+
+// appendUvarint appends the uvarint encoding of v to dst.
+func appendUvarint(dst []byte, v uint64) []byte {
+	var tmp [10]byte
+	n := wire.PutUvarint(tmp[:], 0, v)
+	return append(dst, tmp[:n]...)
 }
 
 func TestEmptyControlFrames(t *testing.T) {

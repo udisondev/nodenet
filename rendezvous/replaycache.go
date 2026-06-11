@@ -1,6 +1,8 @@
 package rendezvous
 
 import (
+	"crypto/ed25519"
+	"encoding/binary"
 	"sync"
 	"time"
 
@@ -54,50 +56,58 @@ func (c *ReplayCache) Open(recipient *identity.Identity, box, aad []byte, now ti
 	if err != nil {
 		return id, pt, err
 	}
-	// Open succeeded, so box is at least ephPubLen long and its first ephPubLen bytes are
-	// the (authenticated-by-signature) ephemeral key.
+	// Open succeeded, so box is well-formed: its first ephPubLen bytes are the
+	// (signature-authenticated) ephemeral key, and the signed timestamp sits at a fixed
+	// offset right after the ephemeral and Ed25519 public keys.
 	var eph [ephPubLen]byte
 	copy(eph[:], box[:ephPubLen])
-	if !c.record(eph, now) {
+	const tsOff = ephPubLen + ed25519.PublicKeySize
+	sealedNano := int64(binary.BigEndian.Uint64(box[tsOff : tsOff+tsLen]))
+	// Expire the entry at sealed+maxAge, not recv+maxAge: the box stays fresh for maxAge
+	// past its own (clock-skew-tolerated, possibly future) timestamp, so dedup must hold
+	// the key for exactly that horizon — otherwise a future-dated box is forgotten while
+	// still openable and replays.
+	if !c.record(eph, now, sealedNano+c.maxAge.Nanoseconds()) {
 		return kad.ID{}, nil, ErrReplay
 	}
 	return id, pt, nil
 }
 
-// record reports whether eph is new (and remembers it); a key still within its window
-// returns false. It evicts expired entries opportunistically. A freshly opened box MUST
-// always be recorded — otherwise its immediate replay would be accepted — so when the
-// current generation is full it rotates (drop prev, cur becomes prev, insert into a new
-// map) rather than refusing the insert or scanning for a victim.
-func (c *ReplayCache) record(eph [ephPubLen]byte, now time.Time) bool {
+// record reports whether eph is new (and remembers it with expiry exp, a Unix-nanosecond
+// deadline derived from the box's signed timestamp); a key still within its window returns
+// false. It evicts expired entries opportunistically. A freshly opened box MUST always be
+// recorded — otherwise its immediate replay would be accepted — so when the current
+// generation is full it rotates (drop prev, cur becomes prev, insert into a new map)
+// rather than refusing the insert or scanning for a victim.
+func (c *ReplayCache) record(eph [ephPubLen]byte, now time.Time, exp int64) bool {
 	nowN := now.UnixNano()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if nowN >= c.sweepAt {
-		for k, exp := range c.cur {
-			if nowN >= exp {
+		for k, e := range c.cur {
+			if nowN >= e {
 				delete(c.cur, k)
 			}
 		}
-		for k, exp := range c.prev {
-			if nowN >= exp {
+		for k, e := range c.prev {
+			if nowN >= e {
 				delete(c.prev, k)
 			}
 		}
 		c.sweepAt = nowN + c.maxAge.Nanoseconds()
 	}
 
-	if exp, ok := c.cur[eph]; ok && nowN < exp {
+	if e, ok := c.cur[eph]; ok && nowN < e {
 		return false // replay within the window
 	}
-	if exp, ok := c.prev[eph]; ok && nowN < exp {
+	if e, ok := c.prev[eph]; ok && nowN < e {
 		return false // replay within the window
 	}
 	if len(c.cur) >= maxReplayEntries/2 {
 		c.prev = c.cur
 		c.cur = make(map[[ephPubLen]byte]int64, maxReplayEntries/2)
 	}
-	c.cur[eph] = nowN + c.maxAge.Nanoseconds()
+	c.cur[eph] = exp
 	return true
 }

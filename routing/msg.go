@@ -3,6 +3,7 @@ package routing
 import (
 	"crypto/ed25519"
 	"encoding/binary"
+	"errors"
 	"hash"
 	"sync"
 	"time"
@@ -11,6 +12,19 @@ import (
 	"github.com/udisondev/nodenet/wire"
 	"golang.org/x/crypto/blake2b"
 )
+
+// MaxAvoid caps the disjoint-path avoid-set a forwarder will accept on a routed
+// message. The avoid-set is unsigned (it mutates per disjoint copy) and the
+// forwarder scans it linearly for every candidate next-hop, so it is effectively
+// level-3 path data that must not dictate per-frame CPU. A legitimate copy carries
+// at most KMin-1 IDs (the other first-hops); KMin is a generous ceiling. Bounding
+// it at decode (level-2 self-protection) stops a hostile navoid — bounded only by
+// the frame size, up to ~2040 IDs — from amplifying O(navoid) work at every hop.
+const MaxAvoid = KMin
+
+// ErrAvoidTooLarge is returned by DecodeMsg when a message declares an avoid-set
+// larger than MaxAvoid.
+var ErrAvoidTooLarge = errors.New("routing: avoid-set exceeds MaxAvoid")
 
 // blakePool reuses BLAKE2b-256 hashers across signingDigest calls so signing and
 // verifying do not allocate a fresh hasher each time. Reset returns a pooled hasher to
@@ -295,6 +309,11 @@ func DecodeMsg(b []byte) (Msg, error) {
 	navoid, err := r.Uvarint()
 	if err != nil {
 		return m, err
+	}
+	// level-2 self-protection: a hostile avoid-set must not drive unbounded per-frame
+	// work, so cap it by the protocol limit before the buffer guard.
+	if navoid > MaxAvoid {
+		return m, ErrAvoidTooLarge
 	}
 	// Guard the multiply against overflow before converting to int: a hostile
 	// navoid cannot make us index past the buffer.

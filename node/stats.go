@@ -12,6 +12,8 @@ type Stats struct {
 	DroppedRateLimited uint64 // control/amplifier frames shed by a rate limiter
 	DroppedInboundFull uint64 // conns refused (and closed) because the inbound-edge cap is reached
 	DroppedEdgeRefused uint64 // edges (in or out) refused by the application's WithEdgeAdmission policy
+	DroppedMalformed   uint64 // unparseable frames from an unregistered conn (the conn is closed)
+	DroppedDupInbound  uint64 // duplicate inbound conns for an already-edged peer (the conn is closed)
 
 	// Inbound media-session admission refusals (per-session drops live in the
 	// session's own MediaStats; these count whole sessions this node refused).
@@ -30,6 +32,8 @@ type counters struct {
 	rateLimited atomic.Uint64
 	inboundFull atomic.Uint64
 	edgeRefused atomic.Uint64
+	malformed   atomic.Uint64
+	dupInbound  atomic.Uint64
 
 	mediaSubPoW  atomic.Uint64
 	mediaConsent atomic.Uint64
@@ -44,6 +48,8 @@ func (c *counters) snapshot() Stats {
 		DroppedRateLimited: c.rateLimited.Load(),
 		DroppedInboundFull: c.inboundFull.Load(),
 		DroppedEdgeRefused: c.edgeRefused.Load(),
+		DroppedMalformed:   c.malformed.Load(),
+		DroppedDupInbound:  c.dupInbound.Load(),
 
 		DroppedMediaSubPoW:  c.mediaSubPoW.Load(),
 		DroppedMediaConsent: c.mediaConsent.Load(),

@@ -106,6 +106,17 @@ func FuzzDecodeNeighbors(f *testing.F) {
 		if err != nil {
 			return
 		}
+		// The level-2 caps must hold on every accepted input.
+		if len(cs) > maxNeighborsContacts {
+			t.Fatalf("accepted %d contacts, over cap %d", len(cs), maxNeighborsContacts)
+		}
+		total := 0
+		for i := range cs {
+			total += len(cs[i].Addrs)
+		}
+		if total > maxNeighborsAddrs {
+			t.Fatalf("accepted %d addresses, over cap %d", total, maxNeighborsAddrs)
+		}
 		buf := make([]byte, neighborsLen(cs))
 		n, err := EncodeNeighbors(buf, cs)
 		if err != nil {

@@ -3,13 +3,58 @@ package routing
 import (
 	"encoding/binary"
 	"math/rand/v2"
+	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/udisondev/nodenet/identity"
 	"github.com/udisondev/nodenet/kad"
+	"github.com/udisondev/nodenet/pow"
 	"github.com/udisondev/nodenet/transport"
 )
+
+// TestObserveClonesAddrsBacking: DecodeNeighbors packs every address string of a
+// whole answer into one shared backing buffer (zero-copy decode). Storing a single
+// contact must NOT keep that shared buffer alive — otherwise one retained contact
+// pins the addresses of every other contact in the response. Observe must clone the
+// stored contact's addresses into their own dense backing.
+func TestObserveClonesAddrsBacking(t *testing.T) {
+	self := kad.ID{0xff}
+	k := NewKnowledge(self, nil, 0)
+
+	// Contact 0 carries a small address; contact 1 a large one. After DecodeNeighbors
+	// both addresses' strings live in the same backing string.
+	cs := []Contact{
+		{ID: fill(1), Addrs: []transport.Addr{{Net: "quic", Endpoint: "h:1"}}},
+		{ID: fill(2), Addrs: []transport.Addr{{Net: strings.Repeat("x", 2048), Endpoint: strings.Repeat("y", 2048)}}},
+	}
+	buf := make([]byte, neighborsLen(cs))
+	n, err := EncodeNeighbors(buf, cs)
+	if err != nil {
+		t.Fatalf("EncodeNeighbors: %v", err)
+	}
+	decoded, err := DecodeNeighbors(buf[:n])
+	if err != nil {
+		t.Fatalf("DecodeNeighbors: %v", err)
+	}
+	// Sanity: the decoder shares one backing across contacts (the very thing whose
+	// over-retention this test guards against).
+	if unsafe.StringData(decoded[0].Addrs[0].Net) == unsafe.StringData(cs[0].Addrs[0].Net) {
+		t.Fatal("decoder did not allocate its own backing (test premise broken)")
+	}
+
+	k.Observe(decoded[0], t0) // store ONLY the first contact
+	saved, ok := k.Get(decoded[0].ID)
+	if !ok {
+		t.Fatal("contact was not stored")
+	}
+	// The stored address must own its backing, not alias the shared decode buffer that
+	// also holds contact 1's 2 KiB strings.
+	if unsafe.StringData(saved.Addrs[0].Net) == unsafe.StringData(decoded[0].Addrs[0].Net) {
+		t.Fatal("stored contact still aliases the shared decode backing (pins the whole answer)")
+	}
+}
 
 // --- shared test helpers (white-box: tests live in package routing) ---
 
@@ -70,12 +115,63 @@ func TestObservePoWFilter(t *testing.T) {
 		t.Fatalf("Closest handed out %d contacts; sub-PoW must not be stored", len(c))
 	}
 
-	good := kad.ID{0x40, 0x02} // 1 leading zero bit — clears d=1
-	if out, _ := k.Observe(Contact{ID: good}, t0); out != ObserveInserted {
+	// A genuine keyed contact whose key hashes to a conforming ID is admitted: the
+	// leading zeros are real work bound to the key. (A keyless leading-zero ID is the
+	// free-bypass case, covered by TestObservePoWFilterKeylessBypass.)
+	goodID, goodKey := keyedClearing(1)
+	if out, _ := k.Observe(Contact{ID: goodID, EdPub: goodKey}, t0); out != ObserveInserted {
 		t.Fatalf("valid contact: got %v, want ObserveInserted", out)
 	}
-	if _, ok := k.Get(good); !ok {
+	if _, ok := k.Get(goodID); !ok {
 		t.Fatal("valid contact did not enter the table")
+	}
+}
+
+// keyedClearing grinds a real identity whose NodeID has at least d leading zero
+// bits, returning its NodeID and Ed25519 public key. Such a contact is keyed (the
+// key hashes to the ID) and its leading zeros are genuine work — the only thing the
+// admission-PoW gate should accept.
+func keyedClearing(d int) (kad.ID, [32]byte) {
+	for s := uint64(1); ; s++ {
+		var seed [identity.SeedLen]byte
+		for i := range 8 {
+			seed[i] = byte(s >> (8 * i))
+		}
+		idn := identity.FromSeed(seed)
+		if pow.Satisfies(idn.ID(), d) {
+			return idn.ID(), edPubOf(idn)
+		}
+	}
+}
+
+// TestObservePoWFilterKeylessBypass: leading zeros only certify work when the
+// NodeID is bound to an Ed25519 key that hashes to it. A keyless ID-only hint can
+// be minted with any leading-zero prefix at zero cost, so with PoW enabled a
+// keyless newcomer must be refused — otherwise the admission gate is free to
+// bypass and the table can be poisoned without grinding. A keyed contact whose key
+// hashes to a conforming ID is still admitted.
+func TestObservePoWFilterKeylessBypass(t *testing.T) {
+	self := kad.ID{0xC0}
+	const dmin = 8
+	k := NewKnowledge(self, nil, dmin)
+
+	// A keyless ID with >= dmin leading zero bits, minted for free.
+	var fake kad.ID
+	fake[1] = 0x01 // 8 leading zero bits, no work done
+	if out, _ := k.Observe(Contact{ID: fake}, t0); out != ObserveRejected {
+		t.Fatalf("keyless leading-zero contact: got %v, want ObserveRejected", out)
+	}
+	if _, ok := k.Get(fake); ok {
+		t.Fatal("keyless fake entered the table (free admission bypass)")
+	}
+	if c := k.Closest(fake, Siblings, nil); len(c) != 0 {
+		t.Fatalf("Closest handed out %d addressless fakes", len(c))
+	}
+
+	// A genuine keyed contact whose key hashes to a conforming ID is admitted.
+	id, key := keyedClearing(dmin)
+	if out, _ := k.Observe(Contact{ID: id, EdPub: key}, t0); out != ObserveInserted {
+		t.Fatalf("keyed conforming contact: got %v, want ObserveInserted", out)
 	}
 }
 

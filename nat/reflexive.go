@@ -83,14 +83,17 @@ func (r *Reflexive) Remove(reporter kad.ID) {
 // Consensus returns the confirmed reflexive address, if one is established: an address
 // at least Quorum distinct neighbours — spanning ≥2 failure domains — agree on. Until
 // then the second result is false and the address should be treated as unknown.
+//
+// A confirmed address is reported even when some OTHER address has more reporters: a
+// larger single-subnet (e.g. sybil) cluster cannot veto a genuine diverse quorum.
 func (r *Reflexive) Consensus() (transport.Addr, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	addr, _, confirmed := r.topLocked()
-	if !confirmed {
+	bestConf, bestConfN, _, _ := r.topLocked()
+	if bestConfN < Quorum {
 		return transport.Addr{}, false
 	}
-	return addr, true
+	return bestConf, true
 }
 
 // Symmetric reports whether the neighbours' reports point at a symmetric NAT: at least
@@ -105,53 +108,60 @@ func (r *Reflexive) Symmetric() bool {
 	if len(r.reports) < Quorum {
 		return false
 	}
-	_, agree, _ := r.topLocked()
-	return agree < Quorum
+	_, _, _, topN := r.topLocked()
+	return topN < Quorum
 }
 
-// topLocked returns the most-reported address, how many neighbours back it, and whether
-// that backing confirms the address: Quorum neighbours AND — when subnet info is present
-// — at least two distinct subnets among them, so a single-subnet sybil cluster cannot
-// confirm a bogus address. When no backing reporter carries subnet info (the in-memory
-// transport), it falls back to the count alone. Caller holds r.mu.
+// topLocked aggregates the reports by address in one pass and returns two winners: the
+// best CONFIRMED address with its backing count, and the overall most-reported address
+// with its count. An address is confirmed by Quorum neighbours AND — when subnet info is
+// present — at least two distinct subnets among them, so a single-subnet sybil cluster
+// cannot confirm a bogus address; with no subnet info (the in-memory transport) it falls
+// back to the count alone. Consensus uses the confirmed winner, Symmetric the overall
+// count. Caller holds r.mu.
 //
-// Ties resolve deterministically — map iteration order must never pick the winner. At
-// equal counts a confirmed address beats an unconfirmed one (so a single-subnet cluster
-// cannot displace a diverse quorum by levelling the score), and an exact tie goes to the
-// lexicographically smaller address.
-func (r *Reflexive) topLocked() (best transport.Addr, agree int, confirmed bool) {
-	// The report set is small (bounded by live-edge degree), so a nested scan is cheaper
-	// than allocating a counting map on this rarely-hot path.
-	for _, e := range r.reports {
-		n := 0
-		var firstSub SubnetKey
-		haveFirst, diverse, withSubnet := false, false, 0
-		for _, o := range r.reports {
-			if o.addr != e.addr {
-				continue
-			}
-			n++
-			if o.hasSubnet {
-				withSubnet++
-				if !haveFirst {
-					firstSub, haveFirst = o.subnet, true
-				} else if o.subnet != firstSub {
-					diverse = true
-				}
-			}
-		}
-		conf := n >= Quorum && (withSubnet == 0 || diverse)
-		switch {
-		case n < agree:
-			continue
-		case n == agree && conf == confirmed && !addrLess(e.addr, best):
-			continue
-		case n == agree && conf != confirmed && !conf:
-			continue
-		}
-		best, agree, confirmed = e.addr, n, conf
+// Tracking the confirmed winner separately is what stops a larger unconfirmed cluster
+// from vetoing a genuine diverse quorum. Ties resolve deterministically — map iteration
+// order must never pick the winner — by the lexicographically smaller address. The single
+// pass is O(reports) rather than the old all-pairs O(reports²), which mattered as the
+// report set grew toward its cap on a path the dispatch decisions hit.
+func (r *Reflexive) topLocked() (bestConf transport.Addr, bestConfN int, top transport.Addr, topN int) {
+	type agg struct {
+		n          int
+		withSubnet int
+		firstSub   SubnetKey
+		haveFirst  bool
+		diverse    bool
 	}
-	return best, agree, confirmed
+	byAddr := make(map[transport.Addr]*agg, len(r.reports))
+	for _, e := range r.reports {
+		a := byAddr[e.addr]
+		if a == nil {
+			a = &agg{}
+			byAddr[e.addr] = a
+		}
+		a.n++
+		if e.hasSubnet {
+			a.withSubnet++
+			if !a.haveFirst {
+				a.firstSub, a.haveFirst = e.subnet, true
+			} else if e.subnet != a.firstSub {
+				a.diverse = true
+			}
+		}
+	}
+
+	haveConf, haveTop := false, false
+	for addr, a := range byAddr {
+		if a.n > topN || (a.n == topN && (!haveTop || addrLess(addr, top))) {
+			top, topN, haveTop = addr, a.n, true
+		}
+		conf := a.n >= Quorum && (a.withSubnet == 0 || a.diverse)
+		if conf && (!haveConf || a.n > bestConfN || (a.n == bestConfN && addrLess(addr, bestConf))) {
+			bestConf, bestConfN, haveConf = addr, a.n, true
+		}
+	}
+	return bestConf, bestConfN, top, topN
 }
 
 // addrLess is the fixed total order used for the final tie-break in topLocked:

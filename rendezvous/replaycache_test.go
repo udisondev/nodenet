@@ -46,6 +46,42 @@ func TestReplayCacheRejectsWithinWindow(t *testing.T) {
 	}
 }
 
+// TestReplayCacheRejectsFutureDatedReplay: an entry must live as long as the box can
+// still be fresh, which is measured from the box's SIGNED timestamp — not from when this
+// node happened to receive it. A box sealed in the (clock-skew-tolerated) future would,
+// if the entry expired at recv+maxAge, be forgotten while still inside its own freshness
+// window, so a captured copy replays. The entry must instead expire at sealed+maxAge.
+func TestReplayCacheRejectsFutureDatedReplay(t *testing.T) {
+	sender := idFromSeed(1)
+	recipient := idFromSeed(2)
+	rx := recipient.KEXPublic()
+	const window = 10 * time.Second
+	cache := NewReplayCache(window)
+
+	recv := time.Unix(1_700_000_000, 0)
+	// Sender's clock runs 8s ahead (dt < window, so the box is accepted as fresh).
+	sealedTS := recv.Add(8 * time.Second)
+	box, err := Seal(&zeroRand{}, sender, rx, []byte("once"), nil, sealedTS)
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	// First open at recv: age = recv - sealed = -8s, inside [-10s, 10s].
+	if _, pt, err := cache.Open(recipient, box, nil, recv); err != nil || string(pt) != "once" {
+		t.Fatalf("first Open: pt=%q err=%v", pt, err)
+	}
+	// Replay at recv+11s: a recv-based entry would have expired at recv+10s, but the box
+	// is still fresh (age = 11s - 8s = 3s). It must be rejected as a replay.
+	if _, _, err := cache.Open(recipient, box, nil, recv.Add(11*time.Second)); !errors.Is(err, ErrReplay) {
+		t.Fatalf("future-dated replay: err = %v, want ErrReplay", err)
+	}
+	// Once the box can no longer be fresh (past sealed+window), the window itself rejects
+	// it as ErrExpired — the entry is gone, the cache does not grow without bound.
+	if _, _, err := cache.Open(recipient, box, nil, sealedTS.Add(window+time.Second)); !errors.Is(err, ErrExpired) {
+		t.Fatalf("truly stale replay: err = %v, want ErrExpired", err)
+	}
+}
+
 // TestReplayCacheEvictsExpired: once a box's window has fully passed, its entry is swept,
 // so the cache does not grow without bound. (Re-opening the same box after expiry is
 // rejected by the window, not the cache — this just asserts the entry is gone.)

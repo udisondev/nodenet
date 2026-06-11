@@ -87,17 +87,22 @@ func Solve(ctx context.Context, rand io.Reader, d int) (*identity.Identity, erro
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var (
-		mu     sync.Mutex // guards rand (shared reader) and the result/err handoff
-		result *identity.Identity
-		failed error
-		wg     sync.WaitGroup
-	)
+	var mu sync.Mutex // guards rand: a single io.Reader is not safe for concurrent use
+
+	// outcome carries the first worker's result or read error to the caller. The
+	// handoff is by channel (not a shared variable), so the caller never reads
+	// worker state under a lock — which matters because a worker wedged inside a
+	// blocking rand.Read holds mu indefinitely, and the caller must still return.
+	type outcome struct {
+		id  *identity.Identity
+		err error
+	}
+	res := make(chan outcome, 1) // buffered: first writer wins, others drop via default
 
 	// GOMAXPROCS, not NumCPU: it tracks the scheduler's actual parallelism
 	// (cgroup CPU quotas included), so the pool never exceeds what can run.
 	for range runtime.GOMAXPROCS(0) {
-		wg.Go(func() {
+		go func() {
 			var seed [identity.SeedLen]byte
 			for {
 				if ctx.Err() != nil {
@@ -110,35 +115,51 @@ func Solve(ctx context.Context, rand io.Reader, d int) (*identity.Identity, erro
 				_, err := io.ReadFull(rand, seed[:])
 				mu.Unlock()
 				if err != nil {
-					mu.Lock()
-					if failed == nil {
-						failed = err
+					select {
+					case res <- outcome{err: err}:
+					default:
 					}
-					mu.Unlock()
 					cancel()
 					return
 				}
 
-				id := identity.FromSeed(seed)
-				if Satisfies(id.ID(), d) {
-					mu.Lock()
-					if result == nil {
-						result = id
+				// Grind with the NodeID-only derivation: testing the threshold
+				// needs just the NodeID, and the full X25519 scalar-mult that
+				// FromSeed runs is wasted work for the ~2^d losing seeds. Mint the
+				// complete identity once, for the single winning seed.
+				if Satisfies(identity.IDFromSeed(seed), d) {
+					select {
+					case res <- outcome{id: identity.FromSeed(seed)}:
+					default:
 					}
-					mu.Unlock()
 					cancel()
 					return
 				}
 			}
-		})
+		}()
 	}
-	wg.Wait()
 
-	if result != nil {
-		return result, nil
+	// Return on the first outcome, or on ctx cancellation. The ctx branch covers
+	// both an external deadline/cancel and a worker wedged in a blocking reader:
+	// either way Solve returns instead of parking forever. A worker that hit just
+	// as ctx fired is still recovered by draining res before reporting ctx.Err().
+	select {
+	case o := <-res:
+		if o.err != nil {
+			return nil, o.err
+		}
+		return o.id, nil
+	case <-ctx.Done():
+		select {
+		case o := <-res:
+			if o.err != nil {
+				return nil, o.err
+			}
+			if o.id != nil {
+				return o.id, nil
+			}
+		default:
+		}
+		return nil, ctx.Err()
 	}
-	if failed != nil {
-		return nil, failed
-	}
-	return nil, ctx.Err()
 }

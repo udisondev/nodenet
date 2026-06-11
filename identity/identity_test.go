@@ -42,6 +42,23 @@ func TestFromSeedDeterministic(t *testing.T) {
 	}
 }
 
+// TestIDFromSeedMatchesFromSeed: the cheap NodeID-only derivation used by the PoW
+// grind must produce exactly the NodeID that the full FromSeed yields, for any
+// seed. The NodeID depends only on the Ed25519 branch, so skipping the X25519
+// scalar-mult cannot change it.
+func TestIDFromSeedMatchesFromSeed(t *testing.T) {
+	var seed [SeedLen]byte
+	for n := range 64 {
+		// Deterministic, distinct seeds without crypto/rand.
+		for i := range seed {
+			seed[i] = byte(i*7 + n*31 + 1)
+		}
+		if got, want := IDFromSeed(seed), FromSeed(seed).ID(); got != want {
+			t.Fatalf("IDFromSeed(seed#%d) = %s, want %s", n, got, want)
+		}
+	}
+}
+
 // TestDifferentSeedsDifferentIdentities: distinct seeds yield distinct identities.
 func TestDifferentSeedsDifferentIdentities(t *testing.T) {
 	a := FromSeed(fixedSeed())

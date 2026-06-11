@@ -86,22 +86,14 @@ func FromSeed(seed [SeedLen]byte) *Identity {
 	// One HKDF-Extract, then one Expand per key with a distinct label. The two
 	// labels make the outputs independent: deriving the X25519 scalar reveals
 	// nothing about the Ed25519 seed and vice versa.
-	prk, err := hkdf.Extract(sha256.New, seed[:], nil)
-	if err != nil {
-		panic("identity: hkdf extract: " + err.Error())
-	}
-	edSeed, err := hkdf.Expand(sha256.New, prk, labelEd25519, ed25519.SeedSize)
-	if err != nil {
-		panic("identity: hkdf expand ed25519: " + err.Error())
-	}
+	prk := extract(seed)
+	signer := edFromPRK(prk)
+	edPub := signer.Public().(ed25519.PublicKey)
+
 	xScalar, err := hkdf.Expand(sha256.New, prk, labelX25519, SeedLen)
 	if err != nil {
 		panic("identity: hkdf expand x25519: " + err.Error())
 	}
-
-	signer := ed25519.NewKeyFromSeed(edSeed)
-	edPub := signer.Public().(ed25519.PublicKey)
-
 	kex, err := ecdh.X25519().NewPrivateKey(xScalar)
 	if err != nil {
 		panic("identity: x25519 private key: " + err.Error())
@@ -114,6 +106,40 @@ func FromSeed(seed [SeedLen]byte) *Identity {
 		kex:    kex,
 		id:     DeriveID(edPub),
 	}
+}
+
+// IDFromSeed derives only the NodeID from a master-seed, skipping the X25519 KEX
+// derivation that FromSeed performs. It is identical to FromSeed(seed).ID() — the
+// NodeID = BLAKE2b(ed_pub) depends solely on the domain-separated Ed25519 branch.
+//
+// The proof-of-work grind needs only the NodeID to test the threshold; the static
+// X25519 scalar-mult that FromSeed runs unconditionally is pure ballast for the
+// ~2^d losing seeds, so the grind uses this and mints the full identity once for
+// the single winner.
+func IDFromSeed(seed [SeedLen]byte) kad.ID {
+	signer := edFromPRK(extract(seed))
+	return DeriveID(signer.Public().(ed25519.PublicKey))
+}
+
+// extract runs HKDF-Extract over the seed. The shared first half of every
+// derivation; cannot fail for a SeedLen-byte input, so a failure is a runtime
+// invariant violation surfaced as a panic.
+func extract(seed [SeedLen]byte) []byte {
+	prk, err := hkdf.Extract(sha256.New, seed[:], nil)
+	if err != nil {
+		panic("identity: hkdf extract: " + err.Error())
+	}
+	return prk
+}
+
+// edFromPRK expands the Ed25519 signing key from the extracted PRK. FromSeed and
+// IDFromSeed share it so the identity branch can never drift between them.
+func edFromPRK(prk []byte) ed25519.PrivateKey {
+	edSeed, err := hkdf.Expand(sha256.New, prk, labelEd25519, ed25519.SeedSize)
+	if err != nil {
+		panic("identity: hkdf expand ed25519: " + err.Error())
+	}
+	return ed25519.NewKeyFromSeed(edSeed)
 }
 
 // ID returns the node identifier, NodeID = BLAKE2b-256(ed_pub).

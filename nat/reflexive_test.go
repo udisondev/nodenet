@@ -141,6 +141,44 @@ func TestReflexiveConsensusTieBreakPrefersConfirmed(t *testing.T) {
 	}
 }
 
+// TestReflexiveDiverseQuorumNotVetoedByLargerCluster: a confirmed (subnet-diverse)
+// quorum must hold even when a larger single-subnet cluster reports a different
+// address. Picking only the single most-reported address let the bigger unconfirmed
+// cluster suppress the confirmed one (Consensus then returned "unknown"), which is a
+// sybil with a few extra cheap identities vetoing a genuine reflexive address.
+func TestReflexiveDiverseQuorumNotVetoedByLargerCluster(t *testing.T) {
+	honest := addr("203.0.113.7:4242")
+	sybil := addr("198.51.100.1:6666")
+
+	orders := [][]report{
+		{ // 3 honest across distinct subnets, then 4 sybils in one subnet
+			{id(1), sub(1), honest}, {id(2), sub(2), honest}, {id(3), sub(3), honest},
+			{id(4), sub(9), sybil}, {id(5), sub(9), sybil}, {id(6), sub(9), sybil}, {id(7), sub(9), sybil},
+		},
+		{ // sybils first
+			{id(4), sub(9), sybil}, {id(5), sub(9), sybil}, {id(6), sub(9), sybil}, {id(7), sub(9), sybil},
+			{id(1), sub(1), honest}, {id(2), sub(2), honest}, {id(3), sub(3), honest},
+		},
+	}
+	for oi, reps := range orders {
+		r := NewReflexive()
+		for _, rep := range reps {
+			r.Record(rep.reporter, rep.subnet, true, rep.addr)
+		}
+		for i := range 64 { // map order varies per call
+			got, ok := r.Consensus()
+			if !ok || got != honest {
+				t.Fatalf("order %d, call %d: Consensus = %v ok=%v, want %v true", oi, i, got, ok, honest)
+			}
+			// The larger cluster does agree among itself (count >= Quorum), so this is
+			// not a symmetric NAT — there is a usable confirmed address.
+			if r.Symmetric() {
+				t.Fatalf("order %d: flagged symmetric despite a confirmed quorum", oi)
+			}
+		}
+	}
+}
+
 // When the tie is exact (same count, same confirmation), the winner is still fixed:
 // the lexicographically smaller address. Different insertion orders and repeated calls
 // must agree.
