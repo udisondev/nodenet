@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -86,6 +87,9 @@ func (c *quicConn) Send(p *transport.Packet) error {
 		// Tear it down (so a partially written, now-desynced frame dies with the
 		// connection and the caller's RemoveEdge is matched by a real close) and report
 		// it; the forward falls to the next disjoint hop and maintenance re-dials.
+		// The log rides the error branch only — the success path stays allocation-free —
+		// and fires at most once per conn (Close makes every later Send return early).
+		slog.Debug("conn send failed, closing", "peer", c.remote, "err", err)
 		c.Close()
 		return transport.ErrConnClosed
 	}
@@ -113,6 +117,7 @@ func (c *quicConn) SendBounded(p *transport.Packet, d time.Duration) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	if err := c.writeFrameLocked(b, d); err != nil {
+		slog.Debug("conn send failed, closing", "peer", c.remote, "err", err)
 		c.Close()
 		return transport.ErrConnClosed
 	}
@@ -172,11 +177,15 @@ func (c *quicConn) readLoop() {
 	for {
 		n, err := readFrameLen(c.br)
 		if err != nil {
+			// Once per conn life, off the per-frame path: this is where the close
+			// reason for a remotely-torn edge surfaces (EOF, reset, oversized frame).
+			slog.Debug("conn read loop ended", "peer", c.remote, "err", err)
 			return
 		}
 		pkt := transport.Get()
 		if _, err := io.ReadFull(c.br, pkt.Buf()[:n]); err != nil {
 			pkt.Release()
+			slog.Debug("conn read loop ended", "peer", c.remote, "err", err)
 			return
 		}
 		pkt.SetLen(n)

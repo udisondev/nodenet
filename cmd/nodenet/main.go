@@ -22,7 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -40,9 +40,6 @@ import (
 )
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
-	log.SetPrefix("nodenet: ")
-
 	var (
 		bootstrap     = flag.String("bootstrap", "", "comma-separated entry peers as <nodeid-hex>@host:port (dial into an existing overlay)")
 		addr          = flag.String("addr", "", "UDP address to listen on, e.g. :4242 or 0.0.0.0:4242 (empty = ephemeral, dial-only)")
@@ -51,19 +48,30 @@ func main() {
 		relay         = flag.Bool("relay", false, "volunteer as a relay for peers that cannot hole-punch")
 		maxInbound    = flag.Int("max-inbound", 256, "global cap on concurrent inbound connections (DoS backstop)")
 		maxInboundIP  = flag.Int("max-inbound-per-ip", 32, "cap on concurrent inbound connections from one source IP")
+		logLevel      = flag.String("log-level", "info", "log verbosity: debug, info, warn or error (debug narrates dials, punches and per-conn drops)")
 	)
 	flag.Parse()
+
+	// The library logs through the default slog logger, so installing the handler is
+	// the only wiring logging needs. Level parsing must precede any logging; on a bad
+	// value fall back to plain stderr (the logger does not exist yet).
+	var lvl slog.Level
+	if err := lvl.UnmarshalText([]byte(*logLevel)); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid -log-level %q: want debug, info, warn or error\n", *logLevel)
+		os.Exit(2)
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})))
 
 	// Require a reason to exist on the overlay: either a way in (bootstrap peers to
 	// dial) or a door for others (a listen address). Without either the node would bind
 	// an ephemeral socket and sit idle with nothing to connect to.
 	if *bootstrap == "" && *addr == "" {
-		log.Fatal("need at least one of -bootstrap (peers to dial) or -addr (address to listen on); usually both")
+		fatal("need at least one of -bootstrap (peers to dial) or -addr (address to listen on); usually both")
 	}
 
 	contacts, err := parseBootstrap(*bootstrap)
 	if err != nil {
-		log.Fatalf("invalid -bootstrap: %v", err)
+		fatal("invalid -bootstrap", "err", err)
 	}
 
 	// Ctrl-C / SIGTERM cancels the run context, which unwinds the loops and lets the
@@ -77,16 +85,16 @@ func main() {
 	if seedFile == "" {
 		var err error
 		if seedFile, err = defaultSeedPath(); err != nil {
-			log.Fatalf("default seed path: %v", err)
+			fatal("default seed path", "err", err)
 		}
 	}
 	id, err := loadOrCreateIdentity(ctx, seedFile, *powDifficulty)
 	if err != nil {
-		log.Fatalf("identity: %v", err)
+		fatal("identity", "err", err)
 	}
 	if !pow.Satisfies(id.ID(), *powDifficulty) {
-		log.Fatalf("seed %s yields NodeID %s, which does not clear -pow=%d; delete it to mint a new identity",
-			seedFile, id.ID(), *powDifficulty)
+		fatal("seed does not clear the PoW difficulty; delete it to mint a new identity",
+			"seed", seedFile, "id", id.ID(), "pow", *powDifficulty)
 	}
 
 	// Transport. An ephemeral socket (":0") when only dialing out; the given address when
@@ -100,7 +108,7 @@ func main() {
 		quic.WithMaxInboundPerIP(*maxInboundIP),
 	)
 	if err != nil {
-		log.Fatalf("listen on %q: %v", listen, err)
+		fatal("listen failed", "addr", listen, "err", err)
 	}
 	defer tr.Close()
 
@@ -113,28 +121,31 @@ func main() {
 	n := node.New(id, tr, opts...)
 	n.Bootstrap(contacts)
 
-	log.Printf("node %s", n.ID())
-	log.Printf("listening on %s (quic)", tr.LocalAddr().Endpoint)
-	if len(contacts) > 0 {
-		log.Printf("bootstrapping from %d peer(s)", len(contacts))
-	}
-	if *relay {
-		log.Print("relay volunteer: on")
-	}
+	// The NodeID is what peers put in their -bootstrap entries, so surface it even
+	// though "node running" repeats it; the rest of the lifecycle story (address,
+	// edges, floor) is the library's log.
+	slog.Info("node identity", "id", n.ID())
 
 	// Drain deliveries and log what arrives. The dispatch loop hands messages off
 	// non-blocking and drops them when the buffer is full, so a sluggish consumer can
 	// never wedge the node — prompt draining is about not LOSING messages.
 	go func() {
 		for msg := range n.Deliveries() {
-			log.Printf("message from %s: %q", msg.Originator, msg.Payload)
+			slog.Info("message received", "from", msg.Originator, "payload", fmt.Sprintf("%q", msg.Payload))
 		}
 	}()
 
 	if err := n.Run(ctx); err != nil && ctx.Err() == nil {
-		log.Fatalf("run: %v", err)
+		fatal("run", "err", err)
 	}
-	log.Print("shutting down")
+	slog.Info("shut down cleanly")
+}
+
+// fatal logs at error level and exits — the slog replacement for log.Fatalf (which,
+// like os.Exit here, never ran the deferred Closes either).
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
 }
 
 // parseBootstrap turns the comma-separated "<nodeid-hex>@host:port" flag into knowledge
@@ -212,7 +223,7 @@ func loadOrCreateIdentity(ctx context.Context, path string, d int) (*identity.Id
 	// First run: mint an identity whose NodeID clears the network PoW (grinding seeds
 	// when d > 0), then persist the seed so the NodeID survives restarts.
 	if d > 0 {
-		log.Printf("minting identity clearing pow=%d (this may take a while)...", d)
+		slog.Info("minting identity (this may take a while)", "pow", d)
 	}
 	id, err := pow.Solve(ctx, rand.Reader, d)
 	if err != nil {
@@ -222,6 +233,6 @@ func loadOrCreateIdentity(ctx context.Context, path string, d int) (*identity.Id
 	if err := os.WriteFile(path, s[:], 0o600); err != nil {
 		return nil, fmt.Errorf("write seed %s: %w", path, err)
 	}
-	log.Printf("minted new identity, seed saved to %s", path)
+	slog.Info("minted new identity", "seed", path)
 	return id, nil
 }

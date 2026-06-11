@@ -61,7 +61,7 @@ func TestDropEdgeClosesConn(t *testing.T) {
 	if err := n.e.AddEdge(conn, true, 0, time.Now()); err != nil {
 		t.Fatalf("AddEdge: %v", err)
 	}
-	n.dropEdge(conn.id)
+	n.dropEdge(conn.id, "test")
 	if !conn.closed.Load() {
 		t.Fatal("dropEdge did not close the edge's conn")
 	}

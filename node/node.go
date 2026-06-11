@@ -44,6 +44,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log/slog"
 	mrand "math/rand/v2"
 	"sync"
 	"time"
@@ -462,6 +463,9 @@ func New(id *identity.Identity, t transport.Transport, opts ...Option) *Node {
 // in for a fresh node (and the test harness): without at least one dialable contact
 // the fill loop has nowhere to begin. Each contact is observed as of now.
 func (n *Node) Bootstrap(contacts []routing.Contact) {
+	if len(contacts) > 0 {
+		slog.Info("bootstrapping", "contacts", len(contacts))
+	}
 	now := time.Now()
 	for i := range contacts {
 		n.observe(contacts[i], now)
@@ -536,13 +540,18 @@ func (n *Node) Run(ctx context.Context) error {
 		defer func() { <-gateDone }()
 	}
 	defer cancel()
+	slog.Info("node running",
+		"id", n.self, "addr", n.t.LocalAddr().Endpoint,
+		"dmin", n.dmin, "relay", n.canRelay, "maintenance", n.maintain)
 	in := n.t.Inbound()
 	for {
 		select {
 		case <-ctx.Done():
+			slog.Info("node stopping", "reason", "context cancelled")
 			return ctx.Err()
 		case d, ok := <-in:
 			if !ok {
+				slog.Info("node stopping", "reason", "transport closed")
 				return nil
 			}
 			n.handle(d)
@@ -636,10 +645,18 @@ func (n *Node) solicited(nonce [routing.LookupNonceLen]byte, now time.Time) bool
 // The closed conn is also tombstoned (noteDropped): a frame of its that was already
 // queued in the inbound channel when the drop ran must not re-register the edge — or,
 // via a trailing pong, re-add the reflexive report removed here — see handle.
-func (n *Node) dropEdge(id kad.ID) {
+//
+// reason names what killed the edge for the log; the log line fires only when a live
+// edge actually existed, so re-drops of an already-removed peer stay silent. It is
+// debug, not info: a peer that opens an inbound edge and immediately sends TypeLeave
+// (or just churns connect→close) drives this at handshake rate from one identity, so
+// info here would be wire-floodable. The floor-phase transitions (logPhaseChange) are
+// the bounded info/warn signal an operator actually wants.
+func (n *Node) dropEdge(id kad.ID, reason string) {
 	if c, ok := n.e.Conn(id); ok {
 		_ = c.Close()
 		n.noteDropped(c, time.Now())
+		slog.Debug("edge dropped", "peer", id, "reason", reason)
 	}
 	n.e.RemoveEdge(id)
 	n.reflexive.Remove(id)
@@ -742,6 +759,7 @@ func (n *Node) handle(d transport.Delivery) {
 		// returns false for an unregistered conn, which we then close. level-2.
 		if d.Conn != nil && !n.e.Touch(d.Conn.Remote(), time.Now()) {
 			n.stats.malformed.Add(1)
+			slog.Debug("inbound conn closed", "peer", d.Conn.Remote(), "reason", "malformed frame")
 			d.Conn.Close()
 		}
 		return
@@ -770,6 +788,7 @@ func (n *Node) handle(d transport.Delivery) {
 				// registered, and its frame is dropped (no forward/relay/rendezvous), so a
 				// cheap identity gets neither an edge nor free transit through us.
 				n.stats.subPoW.Add(1)
+				slog.Debug("inbound conn closed", "peer", from, "reason", "sub-PoW identity")
 				d.Conn.Close()
 				return
 			}
@@ -779,6 +798,7 @@ func (n *Node) handle(d transport.Delivery) {
 			// rests on this refusal.
 			if !n.allowEdge(from) {
 				n.stats.edgeRefused.Add(1)
+				slog.Debug("inbound conn closed", "peer", from, "reason", "refused by edge-admission policy")
 				d.Conn.Close()
 				return
 			}
@@ -792,12 +812,19 @@ func (n *Node) handle(d transport.Delivery) {
 				// All level-2 self-protection.
 				if errors.Is(err, routing.ErrInboundFull) {
 					n.stats.inboundFull.Add(1)
+					slog.Debug("inbound conn closed", "peer", from, "reason", "inbound edge cap reached")
 				} else {
 					n.stats.dupInbound.Add(1)
+					slog.Debug("inbound conn closed", "peer", from, "reason", "duplicate edge")
 				}
 				d.Conn.Close()
 				return
 			}
+			// Debug, not info: an inbound edge's establishment is driven by the remote
+			// side at handshake rate (a pre-mined identity can connect→close in a loop),
+			// so info here would be wire-floodable. Outbound edges (register) are info —
+			// that rate is bounded by our own dialing.
+			slog.Debug("edge established", "peer", from, "addr", d.Conn.RemoteAddr().Endpoint, "direction", "inbound")
 		}
 	}
 
@@ -830,7 +857,7 @@ func (n *Node) handle(d transport.Delivery) {
 		}
 	case routing.TypeLeave:
 		if d.Conn != nil {
-			n.dropEdge(d.Conn.Remote())
+			n.dropEdge(d.Conn.Remote(), "peer left")
 		}
 	case nat.TypeRelayRequest:
 		// level-2 rate-limit: a relay request makes us allocate a spliced session (two real
@@ -877,6 +904,7 @@ func (n *Node) handle(d transport.Delivery) {
 		select {
 		case n.deliver <- Inbound{Originator: from, Payload: append([]byte(nil), payload...)}:
 		default:
+			n.stats.deliverFull.Add(1)
 		}
 	}
 }
@@ -907,6 +935,7 @@ func (n *Node) handleRouted(typ wire.Type, from kad.ID, payload []byte, pkt *tra
 	// difficulty, so sub-threshold originators die at the first honest hop.
 	originator := identity.DeriveID(m.EdPub[:])
 	if !pow.Satisfies(originator, n.dmin) {
+		n.stats.subPoW.Add(1)
 		return
 	}
 
@@ -938,7 +967,7 @@ func (n *Node) handleRouted(typ wire.Type, from kad.ID, payload []byte, pkt *tra
 			if err := n.forwardSend(hop.Conn, pkt); err == nil {
 				break
 			}
-			n.dropEdge(hop.ID)
+			n.dropEdge(hop.ID, "forward send failed")
 		}
 		return
 	}
@@ -963,6 +992,7 @@ func (n *Node) handleRouted(typ wire.Type, from kad.ID, payload []byte, pkt *tra
 			select {
 			case n.deliver <- Inbound{Originator: originator, Payload: append([]byte(nil), m.Payload...)}:
 			default:
+				n.stats.deliverFull.Add(1)
 			}
 			// Opportunistic learning: a delivered packet's originator is a live,
 			// reachable peer worth remembering (its address arrives later via a
@@ -1225,7 +1255,7 @@ func (n *Node) sendNeighbors(target kad.ID, cs []routing.Contact, direct transpo
 	// loop behind a fat neighbours frame.
 	if direct != nil {
 		if n.forwardSend(direct, p) != nil {
-			n.dropEdge(direct.Remote())
+			n.dropEdge(direct.Remote(), "neighbours send failed")
 		}
 		return
 	}
@@ -1235,7 +1265,7 @@ func (n *Node) sendNeighbors(target kad.ID, cs []routing.Contact, direct transpo
 		if err := n.forwardSend(hop.Conn, p); err == nil {
 			break
 		}
-		n.dropEdge(hop.ID)
+		n.dropEdge(hop.ID, "neighbours send failed")
 	}
 }
 
@@ -1298,7 +1328,7 @@ func (n *Node) SendDirect(ctx context.Context, target kad.ID, payload []byte) er
 	p.SetLen(len(f))
 	if err := conn.Send(p); err != nil {
 		// The edge died between lookup and send; drop it so maintenance replaces it.
-		n.dropEdge(conn.Remote())
+		n.dropEdge(conn.Remote(), "direct send failed")
 		return err
 	}
 	return nil
@@ -1362,7 +1392,7 @@ func (n *Node) originate(target kad.ID, typ wire.Type, payload []byte) error {
 			// leaking this goroutine and its pooled buffer for as long as the
 			// peer cares to stall.
 			if n.forwardSend(hop.Conn, p) != nil {
-				n.dropEdge(hop.ID)
+				n.dropEdge(hop.ID, "origination send failed")
 			}
 		}()
 	}
@@ -1480,9 +1510,11 @@ func (n *Node) holePunchRaw(ctx context.Context, target kad.ID, hints []transpor
 		candidates = append(candidates, hints...)
 		candidates = append(candidates, ack.Addrs...)
 		candidates = punchCandidates(candidates)
+		slog.Debug("hole-punch ack received, punching", "peer", target, "candidates", len(candidates))
 		n.burstPunch(ctx, puncher, candidates)
 		return n.dialAnyRaw(ctx, target, candidates)
 	case <-ctx.Done():
+		slog.Debug("hole-punch timed out awaiting ack", "peer", target)
 		return nil, ctx.Err()
 	}
 }
@@ -1528,6 +1560,7 @@ func (n *Node) Connect(ctx context.Context, target kad.ID) (transport.Conn, erro
 	// meaningful cause as the cascade falls through: ErrUnsupported (no Puncher) leaves
 	// the direct dial's error in place rather than masking it.
 	if !n.reflexive.Symmetric() {
+		slog.Debug("direct dial failed, escalating to hole-punch", "peer", target, "err", err)
 		conn, perr := n.HolePunch(ctx, target, res.Addrs)
 		if perr == nil {
 			return conn, nil
@@ -1545,6 +1578,7 @@ func (n *Node) Connect(ctx context.Context, target kad.ID) (transport.Conn, erro
 	// volunteer, return the cascade's last meaningful error (the direct dial's, or the
 	// punch's — e.g. ErrPoWUnmet from register), not a blanket ErrUnroutable.
 	if relay, ok := n.pickRelay(target); ok {
+		slog.Info("hole-punch failed, escalating to relay", "peer", target, "relay", relay)
 		return n.requestRelay(ctx, target, relay)
 	}
 	return nil, err
@@ -1592,10 +1626,12 @@ func (n *Node) OpenMedia(ctx context.Context, target kad.ID) (transport.MediaSes
 		// of trusting a zombie. A peer that merely lacks media support, or a
 		// dial the caller cancelled, says nothing about the edge.
 		if !errors.Is(err, transport.ErrMediaUnsupported) && ctx.Err() == nil {
+			slog.Debug("media dial failed toward a live edge, pinging it", "peer", target, "err", err)
 			n.ping(conn)
 		}
 		return nil, err
 	}
+	slog.Info("media session opened", "peer", target, "addr", conn.RemoteAddr().Endpoint)
 	n.watchMedia(sess, nil)
 	return sess, nil
 }
@@ -1641,6 +1677,7 @@ func (n *Node) admitMedia(s transport.MediaSession) {
 	// bump every edge pays.
 	if !n.admit(s.Remote()) {
 		n.stats.mediaSubPoW.Add(1)
+		slog.Debug("inbound media session refused", "peer", s.Remote(), "reason", "sub-PoW identity")
 		_ = s.Close()
 		return
 	}
@@ -1653,6 +1690,7 @@ func (n *Node) admitMedia(s transport.MediaSession) {
 	peer := s.Remote().String()
 	if !n.mediaSlots.reserve(peer) {
 		n.stats.mediaCap.Add(1)
+		slog.Debug("inbound media session refused", "peer", s.Remote(), "reason", "session cap reached")
 		_ = s.Close()
 		return
 	}
@@ -1661,15 +1699,20 @@ func (n *Node) admitMedia(s transport.MediaSession) {
 	// level-2 consent: nil gate = refuse all, secure by default.
 	if n.mediaConsent == nil || !n.mediaConsent(s.Remote()) {
 		n.stats.mediaConsent.Add(1)
+		slog.Debug("inbound media session refused", "peer", s.Remote(), "reason", "consent refused")
 		_ = s.Close()
 		return
 	}
 	select {
 	case n.mediaIn <- s:
+		slog.Info("inbound media session admitted", "peer", s.Remote())
 	default:
 		// The application is not consuming admitted sessions; refuse rather
-		// than queue unboundedly (bounded queues everywhere).
+		// than queue unboundedly (bounded queues everywhere). This is a local
+		// consumer fault, not wire-driven (the session already passed consent),
+		// so it deserves attention.
 		n.stats.mediaCap.Add(1)
+		slog.Warn("inbound media session dropped", "peer", s.Remote(), "reason", "application not consuming InboundMedia")
 		_ = s.Close()
 	}
 }
@@ -1807,6 +1850,7 @@ func (n *Node) dialContact(ctx context.Context, task dialTask) (transport.Conn, 
 	// punch, so we skip straight to relay. ErrUnsupported (no Puncher) leaves the direct
 	// error in place rather than masking it.
 	if !n.reflexive.Symmetric() {
+		slog.Debug("maintenance dial escalating to hole-punch", "peer", task.id, "err", err)
 		pctx, pcancel := context.WithTimeout(ctx, punchTimeout)
 		conn, perr := n.holePunchRaw(pctx, task.id, hints)
 		pcancel()
@@ -1823,6 +1867,7 @@ func (n *Node) dialContact(ctx context.Context, task dialTask) (transport.Conn, 
 
 	// Relay (last resort): tunnel through a volunteer we have an edge to.
 	if relay, ok := n.pickRelay(task.id); ok {
+		slog.Debug("maintenance dial escalating to relay", "peer", task.id, "relay", relay)
 		rctx, rcancel := context.WithTimeout(ctx, relayTimeout)
 		conn, rerr := n.requestRelayRaw(rctx, task.id, relay)
 		rcancel()
@@ -1852,12 +1897,23 @@ func (n *Node) handleRelayRequest(conn transport.Conn, payload []byte) {
 	}
 	calleeConn, ok := n.e.Conn(target)
 	if !ok {
+		slog.Debug("relay request refused", "callee", target, "reason", "no edge to callee")
 		return // cannot reach the callee to bind it
 	}
 	callerAddr, calleeAddr, _, err := relayer.AllocateRelay()
 	if err != nil {
+		// ErrRelayBusy is normal backpressure — the session cap is reached — and an
+		// attacker can saturate it on demand, so it stays at debug (the transport
+		// already debugs the refusal). A genuine bind failure (fd exhaustion, an OS
+		// limit) degrades the volunteer and is not attacker-paced, so it warns.
+		if errors.Is(err, transport.ErrRelayBusy) {
+			slog.Debug("relay allocation refused", "callee", target, "reason", "session cap reached")
+		} else {
+			slog.Warn("relay allocation failed", "callee", target, "err", err)
+		}
 		return
 	}
+	slog.Info("relay session allocated", "caller", conn.Remote(), "callee", target)
 	n.sendFrame(conn, func(dst []byte) (int, error) {
 		return nat.EncodeRelayGrantFrame(dst, nonce, callerAddr)
 	})
@@ -1913,7 +1969,7 @@ func (n *Node) sendFrame(conn transport.Conn, enc func([]byte) (int, error)) {
 	}
 	p.SetLen(w)
 	if n.forwardSend(conn, p) != nil {
-		n.dropEdge(conn.Remote())
+		n.dropEdge(conn.Remote(), "control send failed")
 	}
 }
 
@@ -1971,6 +2027,7 @@ func (n *Node) punchAsync(p transport.Puncher, addrs []transport.Addr) {
 			n.burstPunch(n.runCtx, p, addrs)
 		}()
 	default: // at the concurrency cap: drop this punch
+		slog.Debug("punch burst dropped", "reason", "concurrency cap reached")
 	}
 }
 
@@ -2074,6 +2131,10 @@ func (n *Node) register(conn transport.Conn, caps routing.Capability, now time.T
 	target := conn.Remote()
 	if !n.admit(target) {
 		_ = conn.Close()
+		// We chose to dial this peer, so a sub-PoW identity here means a poisoned
+		// contact record or a difficulty mismatch — worth an operator's attention,
+		// and rate-bounded by our own dialing, not by the attacker.
+		slog.Warn("dialed peer refused", "peer", target, "reason", "sub-PoW identity")
 		return nil, ErrPoWUnmet
 	}
 	// Level-3 local policy (WithEdgeAdmission): the application refuses this
@@ -2081,17 +2142,20 @@ func (n *Node) register(conn transport.Conn, caps routing.Capability, now time.T
 	if !n.allowEdge(target) {
 		_ = conn.Close()
 		n.stats.edgeRefused.Add(1)
+		slog.Debug("dialed peer refused", "peer", target, "reason", "refused by edge-admission policy")
 		return nil, ErrEdgeRefused
 	}
 	if err := n.e.AddEdge(conn, true, caps, now); err != nil {
 		_ = conn.Close()
 		if errors.Is(err, routing.ErrEdgeExists) {
 			if existing, ok := n.e.Conn(target); ok {
+				slog.Debug("duplicate dial folded into existing edge", "peer", target)
 				return existing, nil
 			}
 		}
 		return nil, err
 	}
+	slog.Info("edge established", "peer", target, "addr", conn.RemoteAddr().Endpoint, "direction", "outbound")
 	// Opportunistic learning: a reached peer is a reachable contact.
 	n.observe(routing.Contact{ID: target}, now)
 	return conn, nil
@@ -2147,6 +2211,14 @@ func (n *Node) maintainLoop(ctx context.Context) {
 	backoff := make(map[kad.ID]backoffState)
 	pending := make(map[kad.ID]bool) // dials in flight, so we never queue a peer twice
 
+	// Tick-paced observability: the floor phase is logged on TRANSITION (not every
+	// tick), and the defensive drop counters are logged as a non-zero DELTA since the
+	// previous tick. Per-frame drops are deliberately never logged where they happen —
+	// an attacker controls that rate — so this is where a flood becomes visible,
+	// throttled to one line per tick.
+	lastPhase := n.e.Status().Phase
+	lastStats := n.stats.snapshot()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -2171,6 +2243,8 @@ func (n *Node) maintainLoop(ctx context.Context) {
 			pruneBackoff(backoff, now, m)
 			n.fill(now, backoff, pending, req)
 			n.drainProbes(now, pending, req) // after fill: floor dials outrank probes
+			lastPhase = n.logPhaseChange(lastPhase)
+			lastStats = n.logDropDelta(lastStats)
 		case <-selfLookup.C:
 			n.selfLookup()
 		case <-sibExchange.C:
@@ -2192,8 +2266,10 @@ func (n *Node) maintainLoop(ctx context.Context) {
 				// one is kept and the newcomer stays in the cache. The probe edge
 				// itself is not wanted — fill chooses edges by its own policy.
 				if out.err != nil {
+					slog.Debug("eviction probe: incumbent dead, evicted", "peer", out.id)
 					n.k.Confirm(out.id, false, now)
 				} else {
+					slog.Debug("eviction probe: incumbent alive, kept", "peer", out.id)
 					n.k.Confirm(out.id, true, now)
 					_ = out.conn.Close()
 				}
@@ -2207,6 +2283,10 @@ func (n *Node) maintainLoop(ctx context.Context) {
 					// re-enters through opportunistic learning like any newcomer.
 					delete(backoff, out.id)
 					n.k.MarkDead(out.id)
+					slog.Info("contact purged", "peer", out.id, "reason", "re-dial backoff exhausted")
+				} else {
+					slog.Debug("dial failed, backing off",
+						"peer", out.id, "err", out.err, "retryIn", backoff[out.id].delay, "fails", backoff[out.id].fails)
 				}
 				continue
 			}
@@ -2216,6 +2296,64 @@ func (n *Node) maintainLoop(ctx context.Context) {
 			_, _ = n.register(out.conn, out.caps, now)
 		}
 	}
+}
+
+// logPhaseChange logs a connectivity-floor phase transition and returns the current
+// phase. Degradation below the urgent watermark warns (the node risks isolation —
+// an operator should see it without debug on); everything else is info. Called once
+// per maintenance tick, so a flapping floor logs at most one line per tick.
+func (n *Node) logPhaseChange(last routing.Phase) routing.Phase {
+	st := n.e.Status()
+	if st.Phase == last {
+		return last
+	}
+	// The band enum increases with health (Bootstrap=0 … Normal=4), so a smaller phase
+	// is a degradation. Sitting in one of the three worst bands (≤ Urgent) warns even
+	// when the move was an improvement within them — the node still risks isolation.
+	direction := "recovered"
+	if st.Phase < last {
+		direction = "degraded"
+	}
+	if st.Phase <= routing.PhaseUrgent {
+		slog.Warn("connectivity floor "+direction, "phase", st.Phase, "was", last, "outEdges", st.OutEdges)
+	} else {
+		slog.Info("connectivity floor "+direction, "phase", st.Phase, "was", last, "outEdges", st.OutEdges)
+	}
+	return st.Phase
+}
+
+// logDropDelta logs the defensive drop counters' growth since the previous tick and
+// returns the fresh snapshot. Only non-zero deltas are reported, so a healthy node
+// logs nothing; under a flood this is the one line per tick that says what is being
+// shed — the flood-safe complement to the never-logged per-frame drop sites.
+func (n *Node) logDropDelta(last Stats) Stats {
+	cur := n.stats.snapshot()
+	attrs := make([]any, 0, 24)
+	for _, d := range [...]struct {
+		name      string
+		cur, last uint64
+	}{
+		{"subPoW", cur.DroppedSubPoW, last.DroppedSubPoW},
+		{"stale", cur.DroppedStale, last.DroppedStale},
+		{"badSig", cur.DroppedBadSig, last.DroppedBadSig},
+		{"rateLimited", cur.DroppedRateLimited, last.DroppedRateLimited},
+		{"inboundFull", cur.DroppedInboundFull, last.DroppedInboundFull},
+		{"edgeRefused", cur.DroppedEdgeRefused, last.DroppedEdgeRefused},
+		{"malformed", cur.DroppedMalformed, last.DroppedMalformed},
+		{"dupInbound", cur.DroppedDupInbound, last.DroppedDupInbound},
+		{"deliverFull", cur.DroppedDeliverFull, last.DroppedDeliverFull},
+		{"mediaSubPoW", cur.DroppedMediaSubPoW, last.DroppedMediaSubPoW},
+		{"mediaConsent", cur.DroppedMediaConsent, last.DroppedMediaConsent},
+		{"mediaCap", cur.DroppedMediaCap, last.DroppedMediaCap},
+	} {
+		if d.cur != d.last {
+			attrs = append(attrs, d.name, d.cur-d.last)
+		}
+	}
+	if len(attrs) > 0 {
+		slog.Info("frames dropped since last tick", attrs...)
+	}
+	return cur
 }
 
 // drainProbes turns pending eviction-probe candidates into probe dials, at most
@@ -2344,7 +2482,7 @@ func (n *Node) keepaliveAndReap(now time.Time, m Maintenance) {
 	// 2*TargetEdges (128) sat below InboundCap (256).
 	var buf [routing.TargetEdges + routing.InboundCap]routing.LiveEdge
 	for _, le := range n.e.Idle(now, m.DeadSibling, m.DeadFinger, buf[:0]) {
-		n.dropEdge(le.ID)
+		n.dropEdge(le.ID, "idle past dead threshold")
 	}
 	for _, le := range n.e.Idle(now, m.KeepaliveSibling, m.KeepaliveFinger, buf[:0]) {
 		n.ping(le.Conn)
@@ -2365,7 +2503,7 @@ func (n *Node) ping(conn transport.Conn) {
 	}
 	p.SetLen(w)
 	if n.forwardSend(conn, p) != nil {
-		n.dropEdge(conn.Remote())
+		n.dropEdge(conn.Remote(), "keepalive send failed")
 	}
 }
 
@@ -2394,7 +2532,7 @@ func (n *Node) fanout(edges []routing.LiveEdge, src *transport.Packet, wait bool
 			// (graceful leave at shutdown) an unbounded Send would hang wg.Wait() forever
 			// and Run would never return; the per-send bound caps the whole fan-out.
 			if n.forwardSend(le.Conn, p) != nil {
-				n.dropEdge(le.ID)
+				n.dropEdge(le.ID, "fanout send failed")
 			}
 		}
 		if wait {
@@ -2478,6 +2616,7 @@ func (n *Node) gracefulLeave() {
 	if len(conns) == 0 {
 		return
 	}
+	slog.Info("announcing graceful leave", "edges", len(conns))
 	p := transport.Get()
 	defer p.Release()
 	w, err := routing.EncodeLeaveFrame(p.Buf())

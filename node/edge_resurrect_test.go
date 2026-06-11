@@ -53,7 +53,7 @@ func TestTrailingFrameDoesNotResurrectDroppedEdge(t *testing.T) {
 	// Drop the first neighbour: its edge goes, and with it its reflexive report —
 	// two remaining reports are below quorum.
 	dropped := conns[0]
-	n.dropEdge(dropped.id)
+	n.dropEdge(dropped.id, "test")
 	if !dropped.closed.Load() {
 		t.Fatal("setup: dropEdge did not close the conn")
 	}
@@ -85,7 +85,7 @@ func TestRedialAfterDropRegisters(t *testing.T) {
 	if err := n.e.AddEdge(old, false, 0, time.Now()); err != nil {
 		t.Fatalf("AddEdge: %v", err)
 	}
-	n.dropEdge(peer)
+	n.dropEdge(peer, "test")
 
 	// The peer re-dials at once: its first frame arrives on a new conn.
 	fresh := &closeRecordConn{id: peer}

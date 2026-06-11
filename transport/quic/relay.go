@@ -1,6 +1,7 @@
 package quic
 
 import (
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -74,6 +75,7 @@ func (t *quicTransport) AllocateRelay() (transport.Addr, transport.Addr, func(),
 	select {
 	case t.relaySlots <- struct{}{}:
 	default:
+		slog.Debug("relay allocation refused", "reason", "session cap reached")
 		return transport.Addr{}, transport.Addr{}, nil, transport.ErrRelayBusy
 	}
 	release := func() { <-t.relaySlots }
@@ -81,12 +83,16 @@ func (t *quicTransport) AllocateRelay() (transport.Addr, transport.Addr, func(),
 	sa, err := t.relaySocket()
 	if err != nil {
 		release()
+		// Not a cap refusal but a local resource failure (fd limits): the volunteer
+		// is degraded as a relay and an operator should notice.
+		slog.Warn("relay socket bind failed", "err", err)
 		return transport.Addr{}, transport.Addr{}, nil, err
 	}
 	sb, err := t.relaySocket()
 	if err != nil {
 		_ = sa.Close()
 		release()
+		slog.Warn("relay socket bind failed", "err", err)
 		return transport.Addr{}, transport.Addr{}, nil, err
 	}
 
@@ -128,6 +134,8 @@ func (t *quicTransport) AllocateRelay() (transport.Addr, transport.Addr, func(),
 	go func() { defer t.wg.Done(); s.pump(sb, sa, &s.bAddr, &s.aAddr) }() // callee side → caller
 	go func() { defer t.wg.Done(); s.idleWatch(closeFn) }()
 
+	slog.Debug("relay session opened",
+		"callerAddr", sa.LocalAddr(), "calleeAddr", sb.LocalAddr())
 	return addrFromNet(sa.LocalAddr()), addrFromNet(sb.LocalAddr()), closeFn, nil
 }
 
@@ -234,6 +242,7 @@ func (s *relaySession) idleWatch(closeFn func()) {
 			return
 		case <-tick.C:
 			if time.Since(time.Unix(0, s.lastActive.Load())) > relayIdleTTL {
+				slog.Debug("relay session reclaimed", "reason", "idle past TTL")
 				closeFn()
 				return
 			}

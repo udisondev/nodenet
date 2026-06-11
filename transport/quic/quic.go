@@ -37,6 +37,7 @@ package quic
 import (
 	"context"
 	"crypto/tls"
+	"log/slog"
 	"net"
 	"net/netip"
 	"sync"
@@ -123,6 +124,9 @@ func (t *quicTransport) acceptLoop(ctx context.Context) {
 		// a read loop is ever spawned; it retries later or routes around us.
 		release, ok := t.admitInbound(remoteIP(qconn.RemoteAddr()))
 		if !ok {
+			// Per-event debug only: an attacker drives this rate with cheap (non-PoW)
+			// handshakes, so anything louder would let it flood the log.
+			slog.Debug("inbound conn refused", "addr", qconn.RemoteAddr(), "reason", "inbound cap reached")
 			_ = qconn.CloseWithError(appCodeNormal, "")
 			continue
 		}
@@ -204,6 +208,7 @@ func (t *quicTransport) admitInbound(ip netip.Addr) (release func(), ok bool) {
 func (t *quicTransport) handleAccepted(ctx context.Context, qconn *quicgo.Conn) {
 	remote, err := peerIDFromConn(qconn.ConnectionState().TLS)
 	if err != nil {
+		slog.Debug("inbound conn refused", "addr", qconn.RemoteAddr(), "reason", "no NodeID in certificate", "err", err)
 		_ = qconn.CloseWithError(appCodeNormal, "")
 		return
 	}
@@ -218,6 +223,7 @@ func (t *quicTransport) handleAccepted(ctx context.Context, qconn *quicgo.Conn) 
 	}
 	str, err := qconn.AcceptStream(actx)
 	if err != nil {
+		slog.Debug("inbound conn dropped", "peer", remote, "addr", qconn.RemoteAddr(), "reason", "no stream within first-frame bound", "err", err)
 		_ = qconn.CloseWithError(appCodeNormal, "")
 		return
 	}
@@ -226,6 +232,7 @@ func (t *quicTransport) handleAccepted(ctx context.Context, qconn *quicgo.Conn) 
 		_ = qconn.CloseWithError(appCodeNormal, "")
 		return
 	}
+	slog.Debug("inbound conn established", "peer", remote, "addr", qconn.RemoteAddr())
 	defer t.wg.Done() // pairs with the read-loop slot registerConn reserved
 	// Drain any extra stream the peer opens on this accepted overlay edge (extra bidi
 	// or any uni — the overlay uses only the one bidi above). The wg counter is ≥1
@@ -293,6 +300,7 @@ func (t *quicTransport) deliver(d transport.Delivery, _ *quicConn) error {
 // the lifecycle on a partially-constructed transport without a real QUIC stack.
 func (t *quicTransport) Close() error {
 	t.closeOnce.Do(func() {
+		slog.Debug("transport closing", "addr", t.localAddr.Endpoint)
 		close(t.done)
 		if t.cancel != nil {
 			t.cancel() // unblock Accept and any in-handshake AcceptStream

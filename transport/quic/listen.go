@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"time"
@@ -236,6 +237,8 @@ func ListenPacketConn(id *identity.Identity, pc net.PacketConn, opts ...Option) 
 	t.wg.Add(2)
 	go t.acceptLoop(ctx)
 	go t.punchDrainLoop()
+	slog.Debug("transport listening",
+		"addr", t.localAddr.Endpoint, "maxInbound", cfg.maxInbound, "maxInboundPerIP", cfg.maxInboundPerIP)
 	return t, nil
 }
 
@@ -254,6 +257,7 @@ func (t *quicTransport) Dial(ctx context.Context, remoteID kad.ID, addr transpor
 
 	qconn, err := t.tr.Dial(ctx, uaddr, t.tlsConf, t.qconf)
 	if err != nil {
+		slog.Debug("dial failed", "peer", remoteID, "addr", addr.Endpoint, "err", err)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -267,6 +271,10 @@ func (t *quicTransport) Dial(ctx context.Context, remoteID kad.ID, addr transpor
 	}
 	if remote != remoteID {
 		_ = qconn.CloseWithError(appCodeNormal, "")
+		// A security-relevant signal: the contact record that named this address is
+		// stale (the peer moved) or poisoned. Rate-bounded by our own dialing.
+		slog.Warn("dialed peer authenticated as a different NodeID",
+			"addr", addr.Endpoint, "want", remoteID, "got", remote)
 		return nil, fmt.Errorf("%w: peer at %s authenticated as a different NodeID", transport.ErrIdentityMismatch, addr.Endpoint)
 	}
 
@@ -292,5 +300,6 @@ func (t *quicTransport) Dial(ctx context.Context, remoteID kad.ID, addr transpor
 		defer t.wg.Done()
 		c.readLoop()
 	}()
+	slog.Debug("outbound conn established", "peer", remote, "addr", addr.Endpoint)
 	return c, nil
 }

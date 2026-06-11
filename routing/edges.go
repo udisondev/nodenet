@@ -80,6 +80,23 @@ const (
 	PhaseNormal
 )
 
+// String names the band for logs and errors.
+func (p Phase) String() string {
+	switch p {
+	case PhaseBootstrap:
+		return "bootstrap"
+	case PhaseCritical:
+		return "critical"
+	case PhaseUrgent:
+		return "urgent"
+	case PhaseNeedsFill:
+		return "needs-fill"
+	case PhaseNormal:
+		return "normal"
+	}
+	return "unknown"
+}
+
 // FloorStatus is the connectivity-floor accounting: the band plus the raw
 // self-maintained (outgoing) edge count it was computed from. Only outgoing edges
 // count — a node behind NAT cannot rely on inbound edges it did not initiate.

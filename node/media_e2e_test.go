@@ -126,7 +126,7 @@ func TestMediaCallSurvivesEdgeChurn(t *testing.T) {
 			t.Fatal("no edge to kill")
 		}
 		_ = conn.Close()
-		a.dropEdge(b.ID())
+		a.dropEdge(b.ID(), "test")
 		synctest.Wait()
 
 		exchange("during-churn")
