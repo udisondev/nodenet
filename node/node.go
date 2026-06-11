@@ -87,13 +87,21 @@ const (
 	defaultInboundBuffer = 64 // delivered-message channel depth
 	hopCandidates        = 8  // next-hop candidates Decide returns (greedy best + repair fallbacks)
 
-	// defaultForwardSendDeadline caps a single forward send on the dispatch loop, so a
-	// slow or hostile next-hop cannot freeze frame processing for the whole node. It is
-	// generous (a genuinely stuck edge, not transient congestion, trips it) and matches
-	// the QUIC transport's own default; its job is to keep forwarding bounded even when
-	// the transport was configured with no send deadline (WithSendDeadline(0)), which
-	// would otherwise let one stuck hop wedge the loop forever. level-2 self-protection.
+	// defaultForwardSendDeadline caps a single peer-bound send on the dispatch loop —
+	// forwards and control answers alike — so a slow or hostile peer cannot freeze
+	// frame processing for the whole node. It is generous (a genuinely stuck edge, not
+	// transient congestion, trips it) and matches the QUIC transport's own default; its
+	// job is to keep those sends bounded even when the transport was configured with no
+	// send deadline (WithSendDeadline(0)), which would otherwise let one stuck peer
+	// wedge the loop forever. level-2 self-protection.
 	defaultForwardSendDeadline = 5 * time.Second
+
+	// maxDroppedTombstones bounds the recently-dropped conn set (Node.dropped): the
+	// whole live set — self-maintained plus inbound-capped peer edges — torn down at
+	// once still fits. Past the cap an arbitrary tombstone is evicted; that conn's
+	// trailing frames then fall back to the keepalive reap, which already bounds a
+	// resurrected edge's life to one cycle.
+	maxDroppedTombstones = routing.TargetEdges + routing.InboundCap
 
 	// maxConcurrentPunch bounds the reactive punch bursts in flight at once. A punch is
 	// spawned in response to an inbound Connect (origination-PoW gated) or RelayBind (over
@@ -187,10 +195,24 @@ type Node struct {
 	// on the caller's goroutine).
 	hopsBuf []routing.LiveEdge
 
-	// fwdDeadline caps a single forward send on the dispatch loop (see
+	// fwdDeadline caps a single peer-bound send on the dispatch loop (see
 	// defaultForwardSendDeadline). A non-positive value falls back to the transport's
 	// own Send (and its global send deadline).
 	fwdDeadline time.Duration
+
+	// dropped is the short-TTL tombstone set of conns dropEdge just closed. The
+	// inbound channel is FIFO, so a frame the peer enqueued before the drop can
+	// surface after it; to handle it looks like the first frame over a new
+	// peer-initiated edge, and re-admitting it would resurrect the closed conn as a
+	// live edge (and a trailing pong would re-add the reflexive report the drop
+	// removed). Keyed on the conn itself — every dial/accept yields a distinct Conn —
+	// so an honest peer that re-dials at once registers unhindered. A closed conn
+	// takes no new frames, so only deliveries already in flight at the close can
+	// carry it; tombstones expire after one keepalive horizon, far longer than those
+	// take to drain. Mutex-guarded: dropEdge runs on the dispatch loop, the
+	// maintenance goroutine and origination goroutines alike.
+	droppedMu sync.Mutex
+	dropped   map[transport.Conn]time.Time // closed conn -> tombstone expiry
 
 	// reflexive consolidates the externally-visible addresses neighbours report seeing
 	// us at (learned from pongs) into a confirmed address once enough of them agree.
@@ -303,11 +325,12 @@ func WithMaintenance(m Maintenance) Option {
 // hole-punch). It has effect only if the transport implements transport.Relayer.
 func WithRelay() Option { return func(n *Node) { n.canRelay = true } }
 
-// WithForwardSendDeadline caps how long a single forward send may block on the
-// dispatch loop before the next-hop edge is dropped and the next disjoint candidate
-// tried — so a slow or hostile next-hop cannot freeze the whole node, even under a
-// transport configured with no send deadline. A non-positive value falls back to the
-// transport's own Send bound. The default is generous (defaultForwardSendDeadline).
+// WithForwardSendDeadline caps how long a single peer-bound send — a forward, a
+// control answer, a keepalive — may block on the dispatch loop before the stuck edge
+// is dropped (a forward then falls to the next disjoint candidate) — so a slow or
+// hostile peer cannot freeze the whole node, even under a transport configured with
+// no send deadline. A non-positive value falls back to the transport's own Send
+// bound. The default is generous (defaultForwardSendDeadline).
 func WithForwardSendDeadline(d time.Duration) Option {
 	return func(n *Node) { n.fwdDeadline = d }
 }
@@ -319,10 +342,14 @@ type boundedSender interface {
 	SendBounded(p *transport.Packet, d time.Duration) error
 }
 
-// forwardSend sends pkt on the dispatch-loop forward path with a bounded budget, so a
-// stuck next-hop cannot wedge the single dispatch loop. It uses the Conn's bounded
-// send when available and a forward deadline is set; otherwise it falls back to Send
-// (whose bound is then the transport's own send deadline). It borrows pkt like Send.
+// forwardSend sends pkt to a peer-controlled edge with a bounded budget. Every such
+// send rides it — forwards, the control answers (pong, neighbours, relay grant/bind),
+// keepalive pings, the origination and leave/lookup fan-outs — so a peer that stops
+// draining its receive side cannot wedge the single dispatch loop or park a
+// maintenance/origination goroutine for as long as it cares to stall. It uses the
+// Conn's bounded send when available and a forward deadline is set; otherwise it
+// falls back to Send (whose bound is then the transport's own send deadline). It
+// borrows pkt like Send.
 func (n *Node) forwardSend(c transport.Conn, pkt *transport.Packet) error {
 	if n.fwdDeadline > 0 {
 		if bs, ok := c.(boundedSender); ok {
@@ -413,6 +440,7 @@ func New(id *identity.Identity, t transport.Transport, opts ...Option) *Node {
 	n.originLimit = newOriginLimiter()
 	n.pendingLookup = make(map[[routing.LookupNonceLen]byte]int64)
 	n.probes = make(map[kad.ID]struct{})
+	n.dropped = make(map[transport.Conn]time.Time)
 	n.punchSem = make(chan struct{}, maxConcurrentPunch)
 	n.mediaIn = make(chan transport.MediaSession, mediaInBuffer)
 	n.mediaSlots = newMediaSlots()
@@ -604,12 +632,50 @@ func (n *Node) solicited(nonce [routing.LookupNonceLen]byte, now time.Time) bool
 // idempotent, so a Send-failure path that already closed the conn is unaffected. level-2
 // self-protection. Conn takes its own RLock; dropEdge holds no edge lock here, and Close
 // is idempotent, so the lookup-then-close is race-free.
+//
+// The closed conn is also tombstoned (noteDropped): a frame of its that was already
+// queued in the inbound channel when the drop ran must not re-register the edge — or,
+// via a trailing pong, re-add the reflexive report removed here — see handle.
 func (n *Node) dropEdge(id kad.ID) {
 	if c, ok := n.e.Conn(id); ok {
 		_ = c.Close()
+		n.noteDropped(c, time.Now())
 	}
 	n.e.RemoveEdge(id)
 	n.reflexive.Remove(id)
+}
+
+// noteDropped tombstones a conn dropEdge just closed, pruning expired tombstones on
+// the way in so the set tracks the drop rate, not history. At the cap an arbitrary
+// entry is evicted: keeping the set bounded matters more than which trailing frames
+// keep their protection, since a resurrected edge is reaped by the next keepalive
+// anyway. level-2 self-protection.
+func (n *Node) noteDropped(c transport.Conn, now time.Time) {
+	exp := now.Add(n.maintenance.KeepaliveSibling)
+	n.droppedMu.Lock()
+	for k, e := range n.dropped {
+		if now.After(e) {
+			delete(n.dropped, k)
+		}
+	}
+	if len(n.dropped) >= maxDroppedTombstones {
+		for k := range n.dropped {
+			delete(n.dropped, k)
+			break
+		}
+	}
+	n.dropped[c] = exp
+	n.droppedMu.Unlock()
+}
+
+// recentlyDropped reports whether c was closed by dropEdge within the tombstone TTL.
+// A frame arriving on such a conn was queued before the drop ran; re-admitting it
+// would resurrect a deliberately-torn edge.
+func (n *Node) recentlyDropped(c transport.Conn, now time.Time) bool {
+	n.droppedMu.Lock()
+	exp, ok := n.dropped[c]
+	n.droppedMu.Unlock()
+	return ok && now.Before(exp)
 }
 
 // observe is the node-side wrapper every knowledge insertion goes through: it folds
@@ -689,6 +755,16 @@ func (n *Node) handle(d transport.Delivery) {
 	if d.Conn != nil {
 		from = d.Conn.Remote()
 		if !n.e.Touch(from, now) {
+			// A trailing frame from a conn dropEdge just closed — queued in the FIFO
+			// inbound channel before the drop ran, indistinguishable here from the
+			// first frame over a new edge. Re-admitting it would resurrect the
+			// deliberately-torn edge (and a trailing pong would re-add the reflexive
+			// report the drop removed), so it is discarded. An honest peer that
+			// re-dials arrives on a fresh conn and registers normally. level-2
+			// self-protection.
+			if n.recentlyDropped(d.Conn, now) {
+				return
+			}
 			if !n.admit(from) {
 				// level-2 admission-PoW: a sub-threshold peer is refused outright — not
 				// registered, and its frame is dropped (no forward/relay/rendezvous), so a
@@ -1144,14 +1220,19 @@ func (n *Node) sendNeighbors(target kad.ID, cs []routing.Contact, direct transpo
 	}
 	p.SetLen(w)
 
+	// Bounded sends throughout, like every dispatch-loop send: a requester or next
+	// hop that stopped draining fails fast and loses its edge instead of wedging the
+	// loop behind a fat neighbours frame.
 	if direct != nil {
-		_ = direct.Send(p)
+		if n.forwardSend(direct, p) != nil {
+			n.dropEdge(direct.Remote())
+		}
 		return
 	}
 	var hopBuf [routing.KMin]routing.LiveEdge
 	hops := n.e.Closest(target, routing.KMin, hopBuf[:0])
 	for _, hop := range hops {
-		if err := hop.Conn.Send(p); err == nil {
+		if err := n.forwardSend(hop.Conn, p); err == nil {
 			break
 		}
 		n.dropEdge(hop.ID)
@@ -1277,7 +1358,10 @@ func (n *Node) originate(target kad.ID, typ wire.Type, payload []byte) error {
 		hop := hops[i]
 		go func() {
 			defer p.Release()
-			if hop.Conn.Send(p) != nil {
+			// Bounded: a stuck first hop fails fast and is dropped, instead of
+			// leaking this goroutine and its pooled buffer for as long as the
+			// peer cares to stall.
+			if n.forwardSend(hop.Conn, p) != nil {
 				n.dropEdge(hop.ID)
 			}
 		}()
@@ -1816,7 +1900,10 @@ func (n *Node) handleRelayBind(payload []byte) {
 }
 
 // sendFrame encodes a control frame with enc into a pooled packet and sends it on conn
-// (borrow-Send; we Release). Best-effort: a dead edge is the maintenance loop's problem.
+// (borrow-Send; we Release). Best-effort, but bounded: it runs on the dispatch loop
+// (pong, relay grant/bind), so a peer that stopped draining its receive side must fail
+// fast and lose its edge — like a failed forward — instead of wedging the whole node
+// behind one stuck send. level-2 self-protection.
 func (n *Node) sendFrame(conn transport.Conn, enc func([]byte) (int, error)) {
 	p := transport.Get()
 	defer p.Release()
@@ -1825,7 +1912,9 @@ func (n *Node) sendFrame(conn transport.Conn, enc func([]byte) (int, error)) {
 		return
 	}
 	p.SetLen(w)
-	_ = conn.Send(p)
+	if n.forwardSend(conn, p) != nil {
+		n.dropEdge(conn.Remote())
+	}
 }
 
 // handleConnect answers a hole-punch request that reached us: route a ConnectAck back
@@ -2262,9 +2351,11 @@ func (n *Node) keepaliveAndReap(now time.Time, m Maintenance) {
 	}
 }
 
-// ping sends a keepalive over conn; a send error means the edge is already gone, so
-// it is dropped at once (the transport's own failure signal, faster than the dead
-// timeout).
+// ping sends a keepalive over conn; a failed or timed-out send means the edge is gone
+// or stuck, so it is dropped at once (the transport's own failure signal, faster than
+// the dead timeout). The send is bounded so a stalled peer cannot park the maintenance
+// goroutine — whose keepalive sweep serves every other edge, and whose exit Run's
+// shutdown waits on.
 func (n *Node) ping(conn transport.Conn) {
 	p := transport.Get()
 	defer p.Release()
@@ -2273,7 +2364,7 @@ func (n *Node) ping(conn transport.Conn) {
 		return
 	}
 	p.SetLen(w)
-	if conn.Send(p) != nil {
+	if n.forwardSend(conn, p) != nil {
 		n.dropEdge(conn.Remote())
 	}
 }

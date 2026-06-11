@@ -108,13 +108,20 @@ func listenerTLSConfig(base *tls.Config) *tls.Config {
 
 // mediaQUICConfig is the dial config of a media connection: datagrams on
 // (mandatory within the media subprotocol — checked after the handshake),
-// the in-call idle/keepalive pair, and the inbound message-stream cap.
+// the in-call idle/keepalive pair, and the inbound message-stream cap. The
+// subprotocol never uses bidirectional streams, so the peer is denied any
+// (negative = none in quic-go): data stuffed into a stream nobody reads would
+// sit in quic-go's buffers up to the connection window, past the session's
+// receive budget (level-2 self-protection). An ACCEPTED session cannot deny
+// bidi in config — its shared listener config must keep the overlay's bidi
+// open — so it drains instead (drainBidiStreams).
 func mediaQUICConfig() *quicgo.Config {
 	return &quicgo.Config{
 		MaxIdleTimeout:        mediaIdleTimeout,
 		KeepAlivePeriod:       mediaKeepAlive,
 		EnableDatagrams:       true,
 		MaxIncomingUniStreams: maxMediaUniStreams,
+		MaxIncomingStreams:    -1,
 	}
 }
 
@@ -219,13 +226,15 @@ func (t *quicTransport) registerMediaSession(s *mediaSession) bool {
 		return false
 	}
 	t.mediaSess[s] = struct{}{}
-	// Three goroutines for every session (pump, datagram-rx, stream-rx), plus a
-	// fourth idle reaper for an ACCEPTED session — its effective QUIC idle is the
+	// Three goroutines for every session (pump, datagram-rx, stream-rx), plus two
+	// more for an ACCEPTED one: the idle reaper — its effective QUIC idle is the
 	// min of both ends, so it needs a local liveness backstop independent of the
-	// peer's advertised value. A dialed session uses our own short media idle, so
-	// it needs none.
+	// peer's advertised value — and the bidi-stream drain, because the shared
+	// listener config must allow bidi streams for overlay edges. A dialed session
+	// needs neither: it uses our own short media idle and its config denies the
+	// peer bidi streams outright.
 	if s.accepted() {
-		t.wg.Add(4)
+		t.wg.Add(5)
 	} else {
 		t.wg.Add(3)
 	}
@@ -307,7 +316,8 @@ func (s *mediaSession) accepted() bool { return s.releaseInbound != nil }
 
 // start launches the session's goroutines, pairing the wg slots
 // registerMediaSession reserved. It must follow a successful registration. An
-// accepted session also runs an idle reaper (see idleReap).
+// accepted session also runs an idle reaper (see idleReap) and a bidi-stream
+// drain (see drainBidiStreams).
 func (s *mediaSession) start() {
 	s.lastRx.Store(time.Now().UnixNano())
 	go func() { defer s.owner.wg.Done(); s.pump() }()
@@ -315,6 +325,7 @@ func (s *mediaSession) start() {
 	go func() { defer s.owner.wg.Done(); s.rxStreams() }()
 	if s.accepted() {
 		go func() { defer s.owner.wg.Done(); s.idleReap() }()
+		go func() { defer s.owner.wg.Done(); s.drainBidiStreams() }()
 	}
 }
 
@@ -337,6 +348,28 @@ func (s *mediaSession) idleReap() {
 				return
 			}
 		}
+	}
+}
+
+// drainBidiStreams resets every bidirectional stream the peer opens on an
+// ACCEPTED media session. The media subprotocol uses datagrams and uni message
+// streams only — never bidi — but the shared listener config must allow bidi
+// for overlay edges, so a media dialer is free to open them; unread, their
+// bytes would sit in quic-go's buffers up to the connection flow-control
+// window, past the session's receive budget (which is charged only on the
+// datagram and uni-stream paths). Resetting returns the flow-control credit
+// immediately — the media mirror of the overlay accept path's extra-stream
+// drain (level-2 self-protection). A bidi stream is never a sign of life
+// (lastRx is untouched), so a peer sending only these is still reaped. The
+// loop ends when the connection or transport closes (the accept errors out).
+func (s *mediaSession) drainBidiStreams() {
+	for {
+		str, err := s.qconn.AcceptStream(s.owner.ctx)
+		if err != nil {
+			return
+		}
+		str.CancelRead(streamCodeDrained)
+		str.CancelWrite(streamCodeDrained)
 	}
 }
 

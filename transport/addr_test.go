@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"slices"
 	"testing"
@@ -192,5 +193,60 @@ func TestParseAddrsEmptyWithTail(t *testing.T) {
 	}
 	if addrs != nil || n != 1 {
 		t.Errorf("ParseAddrs = %+v, n=%d; want nil, n=1", addrs, n)
+	}
+}
+
+// floodAddrsList builds a list payload whose declared count is cnt and whose body
+// is all-zero bytes — each 0x00 parses as an empty address (two zero-length string
+// headers), so without a count cap the whole declared count allocates and parses.
+func floodAddrsList(cnt int) []byte {
+	b := binary.AppendUvarint(nil, uint64(cnt))
+	return append(b, make([]byte, 2*cnt)...)
+}
+
+// ParseAddrsN must refuse an over-cap declared count before allocating the slice:
+// a hostile count amplifies two wire bytes per empty entry into a 32-byte Addr, so
+// the rejection has to be O(1) and allocation-free regardless of buffer size.
+func TestParseAddrsNRejectsOverCount(t *testing.T) {
+	flood := floodAddrsList(500_000) // ~1 MiB of zeros, would expand to ~16 MiB of Addr
+	if allocs := testing.AllocsPerRun(10, func() {
+		addrs, n, err := ParseAddrsN(flood, 16)
+		if !errors.Is(err, ErrTooManyAddrs) {
+			t.Fatalf("ParseAddrsN(flood, 16): err = %v, want ErrTooManyAddrs", err)
+		}
+		if addrs != nil || n != 0 {
+			t.Fatalf("ParseAddrsN(flood, 16) = %+v, n=%d on error; want nil, 0", addrs, n)
+		}
+	}); allocs != 0 {
+		t.Errorf("over-count rejection allocated %.0f times, want 0", allocs)
+	}
+	// One past the cap is refused; the cap itself is allowed (count bound only —
+	// the body must still parse).
+	if _, _, err := ParseAddrsN(floodAddrsList(17), 16); !errors.Is(err, ErrTooManyAddrs) {
+		t.Errorf("count 17 with max 16: err = %v, want ErrTooManyAddrs", err)
+	}
+	if _, _, err := ParseAddrsN(floodAddrsList(16), 16); err != nil {
+		t.Errorf("count 16 with max 16: err = %v, want nil", err)
+	}
+	// A negative max admits nothing.
+	if _, _, err := ParseAddrsN([]byte{1, 0, 0}, -1); !errors.Is(err, ErrTooManyAddrs) {
+		t.Errorf("negative max: err = %v, want ErrTooManyAddrs", err)
+	}
+}
+
+// Within the cap, ParseAddrsN parses exactly what ParseAddrs does.
+func TestParseAddrsNRoundTrip(t *testing.T) {
+	want := []Addr{
+		{Net: "quic", Endpoint: "203.0.113.4:443"},
+		{},
+		{Net: "mem", Endpoint: "node-7"},
+	}
+	enc := AppendAddrs(nil, want)
+	got, n, err := ParseAddrsN(enc, len(want))
+	if err != nil {
+		t.Fatalf("ParseAddrsN: %v", err)
+	}
+	if !slices.Equal(got, want) || n != len(enc) {
+		t.Errorf("ParseAddrsN = %+v, n=%d; want %+v, n=%d", got, n, want, len(enc))
 	}
 }

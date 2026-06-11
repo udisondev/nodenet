@@ -91,6 +91,22 @@ func TestSolve(t *testing.T) {
 	}
 }
 
+// TestSolveSequentialReaderReuse: consecutive Solve calls may share one
+// stateful, non-thread-safe reader — the natural pattern for minting several
+// deterministic identities from a single source. Solve must therefore join its
+// workers before returning on the normal path: a loser from call N still queued
+// on the per-call rand lock would otherwise hit the reader concurrently with
+// call N+1's workers. The per-call mutex cannot order accesses across calls, so
+// without the join this loop is a data race (caught by -race).
+func TestSolveSequentialReaderReuse(t *testing.T) {
+	r := &counterReader{}
+	for range 2000 {
+		if _, err := Solve(context.Background(), r, 2); err != nil {
+			t.Fatalf("Solve: %v", err)
+		}
+	}
+}
+
 func TestSolveUnsatisfiable(t *testing.T) {
 	_, err := Solve(context.Background(), &counterReader{}, kad.IDBits+1)
 	if !errors.Is(err, ErrUnsatisfiable) {

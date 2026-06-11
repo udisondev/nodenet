@@ -27,6 +27,16 @@ const (
 	NonceLen = 16
 )
 
+// maxCoordAddrs is the level-2 self-protection cap on the address list a Hello or
+// Reply may carry. A node announces only a handful of coordinates (its local
+// address plus a reflexive one), so the cap rejects nothing legitimate — but
+// bounding the declared count against it, not just the remaining buffer, keeps
+// the decoders' allocation a protocol constant: two wire bytes per empty address
+// expand to a 32-byte transport.Addr (~16x), and the Reply decoder runs before
+// any signature or nonce check. The encoders enforce the same bound so a message
+// that would not decode is never produced.
+const maxCoordAddrs = 16
+
 // Hello is A's rendezvous request to R. A fills XPub (its static X25519 public key),
 // Addrs (its reflexive coordinates — where R can later reach it directly), and a fresh
 // Nonce, then signs with SignHello. The originator's Ed25519 public key is NOT carried
@@ -130,9 +140,13 @@ func MarshalReply(r *Reply) ([]byte, error) {
 
 // EncodeHello writes h into dst in place and returns the bytes written. It does not
 // grow dst (a dst shorter than the encoding is wire.ErrShortBuffer; an encoding past
-// wire.MaxFrameLen is wire.ErrFrameTooLarge): the appends below stay within dst's
-// checked length, so they never reallocate.
+// wire.MaxFrameLen is wire.ErrFrameTooLarge; an address list over the protocol cap is
+// transport.ErrTooManyAddrs — DecodeHello would refuse it): the appends below stay
+// within dst's checked length, so they never reallocate.
 func EncodeHello(dst []byte, h *Hello) (int, error) {
+	if len(h.Addrs) > maxCoordAddrs {
+		return 0, transport.ErrTooManyAddrs
+	}
 	n := helloLen(h)
 	if n > wire.MaxFrameLen {
 		return 0, wire.ErrFrameTooLarge
@@ -147,8 +161,12 @@ func EncodeHello(dst []byte, h *Hello) (int, error) {
 	return len(b), nil
 }
 
-// EncodeReply writes r into dst in place and returns the bytes written.
+// EncodeReply writes r into dst in place and returns the bytes written. Errors as
+// EncodeHello.
 func EncodeReply(dst []byte, r *Reply) (int, error) {
+	if len(r.Addrs) > maxCoordAddrs {
+		return 0, transport.ErrTooManyAddrs
+	}
 	n := replyLen(r)
 	if n > wire.MaxFrameLen {
 		return 0, wire.ErrFrameTooLarge
@@ -166,17 +184,17 @@ func EncodeReply(dst []byte, r *Reply) (int, error) {
 
 // DecodeHello parses a Hello from b (a routing.Msg payload). The returned Hello owns
 // its address strings, so it outlives b. It is defensive against untrusted input: the
-// address count is bounded before allocating (inside transport.ParseAddrs), it never
-// panics on malformed bytes, and it enforces the canonical wire form — b must end
-// exactly where the message does, so b and b||junk never decode to the same Hello
-// (the same rule routing.DecodeMsg applies).
+// address count is bounded by maxCoordAddrs before allocating (a hostile count is
+// refused with transport.ErrTooManyAddrs), it never panics on malformed bytes, and it
+// enforces the canonical wire form — b must end exactly where the message does, so b
+// and b||junk never decode to the same Hello (the same rule routing.DecodeMsg applies).
 func DecodeHello(b []byte) (Hello, error) {
 	var h Hello
 	if len(b) < len(h.XPub) {
 		return h, wire.ErrShortBuffer
 	}
 	copy(h.XPub[:], b)
-	addrs, n, err := transport.ParseAddrs(b[len(h.XPub):])
+	addrs, n, err := transport.ParseAddrsN(b[len(h.XPub):], maxCoordAddrs)
 	if err != nil {
 		return h, err
 	}
@@ -201,7 +219,7 @@ func DecodeReply(b []byte) (Reply, error) {
 	}
 	copy(rep.EdPub[:], b)
 	copy(rep.XPub[:], b[len(rep.EdPub):])
-	addrs, n, err := transport.ParseAddrs(b[pubsLen:])
+	addrs, n, err := transport.ParseAddrsN(b[pubsLen:], maxCoordAddrs)
 	if err != nil {
 		return rep, err
 	}

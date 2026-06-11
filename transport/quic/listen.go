@@ -184,7 +184,8 @@ func ListenPacketConn(id *identity.Identity, pc net.PacketConn, opts ...Option) 
 	// (negative = none in quic-go) so it cannot stuff data into extra streams that
 	// quic-go would buffer past the per-frame PoW gate. The listener (lconf) still
 	// accepts the peer's single overlay bidi and media uni-streams; its extra streams
-	// are reset by the accept path's drain instead (handleAccepted).
+	// are reset by the accept paths' drains instead (drainExtraStreams on an overlay
+	// edge, drainBidiStreams on a media session).
 	qconf.MaxIncomingStreams = -1
 	qconf.MaxIncomingUniStreams = -1
 	tr := &quicgo.Transport{Conn: pc}

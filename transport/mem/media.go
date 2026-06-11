@@ -85,22 +85,28 @@ func (t *memTransport) OpenMedia(ctx context.Context, remoteID kad.ID, addr tran
 func (t *memTransport) InboundMedia() <-chan transport.MediaSession { return t.inMedia }
 
 // addMediaSession tracks a session end for Close teardown; it reports false if
-// the transport is already closed.
+// the transport is already closed. Same locking pairing as addConn: mu's read
+// lock covers the closed check and the append, so the session is either in
+// Close's snapshot or refused.
 func (t *memTransport) addMediaSession(s *memMediaSession) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	if t.closed {
 		return false
 	}
+	t.connsMu.Lock()
 	t.media = append(t.media, s)
+	t.connsMu.Unlock()
 	return true
 }
 
 // removeMediaSession forgets a finished session (called from its pump's
-// shutdown), keeping the tracking slice bounded over a transport's life.
+// shutdown), keeping the tracking slice bounded over a transport's life. Like
+// removeConn it takes only connsMu, so a pump unwinding never waits behind an
+// overlay deliver parked under mu.
 func (t *memTransport) removeMediaSession(s *memMediaSession) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.connsMu.Lock()
+	defer t.connsMu.Unlock()
 	for i, cur := range t.media {
 		if cur == s {
 			t.media[i] = t.media[len(t.media)-1]

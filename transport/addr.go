@@ -3,6 +3,7 @@ package transport
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 )
 
 // Addr is a transport-level endpoint hint: where a peer can be reached before a
@@ -43,7 +44,8 @@ func (a Addr) String() string {
 //
 // The encoders are append-style and allocation-free given capacity. The parsers
 // are defensive against untrusted input (level-2: every byte off the wire is
-// bounds-checked before use, declared counts are bounded before allocating, and
+// bounds-checked before use, declared counts are bounded before allocating —
+// list decoders of untrusted input pass their protocol cap to ParseAddrsN — and
 // malformed bytes return ErrBadAddr — never a panic). Parsed strings are COPIES
 // of the input, so an Addr safely outlives the receive buffer it was parsed
 // from (Packet buffers return to a pool).
@@ -58,6 +60,12 @@ const MinAddrWireLen = 2
 // buffer ended mid-value, a declared length ran past it, or a varint did not
 // decode. Callers match it with errors.Is.
 var ErrBadAddr = errors.New("transport: malformed address encoding")
+
+// ErrTooManyAddrs means a declared address count exceeded the caller's cap
+// (ParseAddrsN) — the list is refused before anything is allocated. Encoders of
+// capped messages return it as well, so a message that would not decode is never
+// produced. Callers match it with errors.Is.
+var ErrTooManyAddrs = errors.New("transport: address count exceeds cap")
 
 // AddrWireLen reports the encoded size of a — what AppendAddr will append.
 // It lets a caller size a buffer exactly before encoding.
@@ -117,13 +125,29 @@ func ParseAddr(b []byte) (a Addr, n int, err error) {
 
 // ParseAddrs parses a uvarint-counted address list from the front of b and
 // returns it with the number of bytes consumed. The declared count is bounded
-// against the remaining buffer (MinAddrWireLen per entry) before allocating, so
-// a hostile count cannot drive an absurd allocation. An empty list parses to a
-// nil slice. Trailing bytes are the caller's, as with ParseAddr.
+// only against the remaining buffer (MinAddrWireLen per entry), so a hostile
+// count cannot run past it — but every entry can still be a 2-byte empty address
+// that expands to a 32-byte Addr, a ~16x allocation amplification. Decoders of
+// untrusted input therefore use ParseAddrsN with their protocol cap instead;
+// this uncapped form is for input whose size the caller already bounds. An
+// empty list parses to a nil slice. Trailing bytes are the caller's, as with
+// ParseAddr.
 func ParseAddrs(b []byte) (addrs []Addr, n int, err error) {
+	return ParseAddrsN(b, math.MaxInt)
+}
+
+// ParseAddrsN is ParseAddrs with a count cap: a declared count above max is
+// refused with ErrTooManyAddrs BEFORE the slice is allocated (level-2
+// self-protection — the decoder's allocation stays a protocol constant,
+// independent of how large a frame a peer can deliver). Every decoder of an
+// untrusted address list passes the small per-message cap of its protocol.
+func ParseAddrsN(b []byte, max int) (addrs []Addr, n int, err error) {
 	cnt, n := binary.Uvarint(b)
 	if n <= 0 {
 		return nil, 0, ErrBadAddr
+	}
+	if max < 0 || cnt > uint64(max) {
+		return nil, 0, ErrTooManyAddrs
 	}
 	if cnt > uint64(len(b)-n)/MinAddrWireLen {
 		return nil, 0, ErrBadAddr

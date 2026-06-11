@@ -234,6 +234,40 @@ func TestObserveRefresh(t *testing.T) {
 	}
 }
 
+// TestObserveSameAddrRefreshNoAlloc: re-observing a known contact with the very
+// addresses already stored is the steady state of neighbours-learning and
+// sibling-exchange (every round re-delivers an unchanged contact). The stored entry
+// already owns an independent clone of those addresses, so such a refresh must not
+// re-clone them — the refresh path allocates nothing. Only an actual address change
+// pays for a clone, and that clone must still break aliasing into the observation's
+// backing (the decode-buffer-pinning guard of TestObserveClonesAddrsBacking).
+func TestObserveSameAddrRefreshNoAlloc(t *testing.T) {
+	self := kad.ID{0xff}
+	k := NewKnowledge(self, nil, 0)
+	c := contactInBucket(self, 10, 1)
+	c.Addrs = []transport.Addr{{Net: "quic", Endpoint: "192.0.2.7:443"}}
+	k.Observe(c, t0)
+
+	if allocs := testing.AllocsPerRun(100, func() {
+		k.Observe(c, t0)
+	}); allocs != 0 {
+		t.Fatalf("same-address refresh: %.0f allocs/op, want 0", allocs)
+	}
+
+	// A changed-address refresh still replaces the stored addresses with an
+	// independently-backed copy.
+	upd := c
+	upd.Addrs = []transport.Addr{{Net: "quic", Endpoint: "198.51.100.9:443"}}
+	k.Observe(upd, t0.Add(time.Minute))
+	got, _ := k.Get(c.ID)
+	if len(got.Addrs) != 1 || got.Addrs[0] != upd.Addrs[0] {
+		t.Fatalf("changed-address refresh not applied: got %v", got.Addrs)
+	}
+	if unsafe.StringData(got.Addrs[0].Endpoint) == unsafe.StringData(upd.Addrs[0].Endpoint) {
+		t.Fatal("stored address aliases the observation's backing")
+	}
+}
+
 // TestObserveMergesBoundKey: an ID-only hint that is later re-observed with the matching
 // Ed25519 key folds the key in (keyless → keyed upgrade), since the key binds to the ID.
 func TestObserveMergesBoundKey(t *testing.T) {

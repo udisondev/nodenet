@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/udisondev/nodenet/identity"
 	"github.com/udisondev/nodenet/kad"
@@ -171,12 +173,12 @@ func TestMemConnsBounded(t *testing.T) {
 		conn.Close()
 	}
 
-	a.mu.RLock()
+	a.connsMu.Lock()
 	na := len(a.conns)
-	a.mu.RUnlock()
-	b.mu.RLock()
+	a.connsMu.Unlock()
+	b.connsMu.Lock()
 	nb := len(b.conns)
-	b.mu.RUnlock()
+	b.connsMu.Unlock()
 	if na != 0 || nb != 0 {
 		t.Fatalf("conns not reclaimed: a=%d b=%d, want 0,0", na, nb)
 	}
@@ -198,6 +200,187 @@ func TestHubRegister(t *testing.T) {
 	if _, err := h.New(idA, addr("c")); err == nil {
 		t.Error("duplicate id accepted, want error")
 	}
+}
+
+// TestCloseNotBlockedByParkedDeliver: a deliver parked on a full inbound channel
+// holds the receiving transport's read lock for the whole channel send; closing an
+// UNRELATED edge of the same transport must not wait behind it. Before the fix
+// removeConn took the same mutex's write lock, so one undrained receiver plus one
+// Conn.Close wedged forever — and since the node's dispatch loop is both the only
+// Inbound consumer and the goroutine that closes edges, the whole transport
+// deadlocked (the pending writer also blocks every new read lock, so all further
+// Sends to the transport froze too). Real time, not synctest: blocking on a mutex
+// is not a durably-blocking operation, so the fake clock cannot drive this repro;
+// the timeout below is protective only — the green path returns at once.
+func TestCloseNotBlockedByParkedDeliver(t *testing.T) {
+	h := NewHub(WithInboundBuffer(0))
+	xt, err := h.New(nodeID(1), addr("x"))
+	if err != nil {
+		t.Fatalf("New x: %v", err)
+	}
+	at, err := h.New(nodeID(2), addr("a"))
+	if err != nil {
+		t.Fatalf("New a: %v", err)
+	}
+	bt, err := h.New(nodeID(3), addr("b"))
+	if err != nil {
+		t.Fatalf("New b: %v", err)
+	}
+	defer xt.Close()
+	defer at.Close()
+	defer bt.Close()
+
+	connA, err := at.Dial(context.Background(), nodeID(1), addr("x"))
+	if err != nil {
+		t.Fatalf("Dial a->x: %v", err)
+	}
+	connB, err := bt.Dial(context.Background(), nodeID(1), addr("x"))
+	if err != nil {
+		t.Fatalf("Dial b->x: %v", err)
+	}
+
+	// Park a sender on edge A: x's inbound is unbuffered and nobody reads it, so
+	// the deliver blocks inside the channel send holding x's read lock.
+	sent := make(chan error, 1)
+	go func() {
+		p := transport.Get()
+		p.SetLen(4)
+		err := connA.Send(p)
+		p.Release()
+		sent <- err
+	}()
+	// Wait until the parked deliver actually holds the read lock: TryLock fails
+	// only while a reader is inside, and the parked deliver is the only one.
+	x := xt.(*memTransport)
+	for x.mu.TryLock() {
+		x.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+
+	// Closing the unrelated edge B must return promptly.
+	closed := make(chan struct{})
+	go func() {
+		connB.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close of an unrelated edge blocked behind a deliver parked on a full inbound channel")
+	}
+
+	// Unpark the sender and let it finish.
+	d := <-xt.Inbound()
+	d.Pkt.Release()
+	if err := <-sent; err != nil {
+		t.Fatalf("parked Send: %v", err)
+	}
+}
+
+// TestSendBoundedZeroFallsBackToHubBound: SendBounded documents that a
+// non-positive budget falls back to the Hub send bound, exactly as the QUIC conn
+// falls back to its transport's send deadline. Before the fix d<=0 was passed
+// through to deliverBounded, which treats it as UNBOUNDED — so the send parked
+// forever on the very stalled receiver the Hub bound was configured to guard
+// against, strictly worse than a plain Send.
+func TestSendBoundedZeroFallsBackToHubBound(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const bound = 5 * time.Second
+		h := NewHub(WithInboundBuffer(0), WithSendBound(bound))
+		xt, err := h.New(nodeID(1), addr("x"))
+		if err != nil {
+			t.Fatalf("New x: %v", err)
+		}
+		at, err := h.New(nodeID(2), addr("a"))
+		if err != nil {
+			t.Fatalf("New a: %v", err)
+		}
+		defer xt.Close()
+		defer at.Close()
+		conn, err := at.Dial(context.Background(), nodeID(1), addr("x"))
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+
+		// x's inbound is unbuffered and never drained, so the send can only
+		// return through the fallback bound.
+		mc := conn.(*memConn)
+		done := make(chan error, 1)
+		go func() {
+			p := transport.Get()
+			p.SetLen(4)
+			err := mc.SendBounded(p, 0)
+			p.Release()
+			done <- err
+		}()
+
+		// Sleep past the Hub bound on the fake clock; a sender that armed the
+		// fallback timer has returned by now.
+		time.Sleep(bound + time.Second)
+		select {
+		case err := <-done:
+			if !errors.Is(err, transport.ErrConnClosed) {
+				t.Fatalf("SendBounded(p, 0) err = %v, want ErrConnClosed", err)
+			}
+		default:
+			// Unpark the sender so the bubble drains, then fail.
+			d := <-xt.Inbound()
+			d.Pkt.Release()
+			<-done
+			t.Fatal("SendBounded(p, 0) ignored the Hub send bound and parked past it")
+		}
+	})
+}
+
+// TestSendBoundTimeoutClosesEdge: a Send that trips the Hub send bound reports
+// ErrConnClosed — and the edge must actually BE down for both ends afterwards,
+// mirroring the QUIC conn tearing the connection down on a tripped send deadline.
+// Before the fix the edge stayed open: the sender had just been told the edge is
+// dead while the peer kept using it successfully, a split state unreachable on
+// the real transport.
+func TestSendBoundTimeoutClosesEdge(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := NewHub(WithInboundBuffer(0), WithSendBound(time.Second))
+		xt, err := h.New(nodeID(1), addr("x"))
+		if err != nil {
+			t.Fatalf("New x: %v", err)
+		}
+		at, err := h.New(nodeID(2), addr("a"))
+		if err != nil {
+			t.Fatalf("New a: %v", err)
+		}
+		defer xt.Close()
+		defer at.Close()
+		conn, err := at.Dial(context.Background(), nodeID(1), addr("x"))
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+
+		// x's inbound is unbuffered and never drained: the send trips the bound.
+		p := transport.Get()
+		p.SetLen(4)
+		err = conn.Send(p)
+		p.Release()
+		if !errors.Is(err, transport.ErrConnClosed) {
+			t.Fatalf("bounded Send err = %v, want ErrConnClosed", err)
+		}
+
+		// The tripped bound killed the edge for both ends, not just this Send.
+		mc := conn.(*memConn)
+		select {
+		case <-mc.edge.closed:
+		default:
+			t.Fatal("send-bound timeout left the edge open; the QUIC mirror closes it")
+		}
+		// The peer end observes the close on its next Send.
+		q := transport.Get()
+		q.SetLen(4)
+		err = mc.peerConn.Send(q)
+		q.Release()
+		if !errors.Is(err, transport.ErrConnClosed) {
+			t.Fatalf("peer Send after the tripped bound: err = %v, want ErrConnClosed", err)
+		}
+	})
 }
 
 // After Close, Dial to the closed transport's address fails (it is deregistered).

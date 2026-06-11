@@ -79,11 +79,20 @@ func Satisfies(id kad.ID, d int) bool {
 // a hit, Solve returns ctx.Err(). A read error from rand aborts with that error.
 // A difficulty above the NodeID bit length is rejected up front with
 // ErrUnsatisfiable rather than grinding forever; d <= 0 is met by the first seed.
+//
+// On a normal return — a hit or a rand error — Solve has joined every worker,
+// so rand is no longer in use and a stateful, non-thread-safe reader may be
+// reused for the next call. Only when the caller's ctx fires can Solve return
+// while a worker is still wedged inside a blocking rand.Read; treat the reader
+// as still borrowed by Solve in that case.
 func Solve(ctx context.Context, rand io.Reader, d int) (*identity.Identity, error) {
 	if d > kad.IDBits {
 		return nil, ErrUnsatisfiable
 	}
 
+	// ext is the caller's context: the one escape hatch from joining the
+	// workers below, kept reachable past the shadowing.
+	ext := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -101,8 +110,11 @@ func Solve(ctx context.Context, rand io.Reader, d int) (*identity.Identity, erro
 
 	// GOMAXPROCS, not NumCPU: it tracks the scheduler's actual parallelism
 	// (cgroup CPU quotas included), so the pool never exceeds what can run.
+	var wg sync.WaitGroup
 	for range runtime.GOMAXPROCS(0) {
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			var seed [identity.SeedLen]byte
 			for {
 				if ctx.Err() != nil {
@@ -138,6 +150,26 @@ func Solve(ctx context.Context, rand io.Reader, d int) (*identity.Identity, erro
 			}
 		}()
 	}
+
+	// idle closes once every worker has exited, i.e. no goroutine of this call
+	// can touch rand anymore.
+	idle := make(chan struct{})
+	go func() { wg.Wait(); close(idle) }()
+
+	// join stops the search and waits the workers out, so that on return the
+	// caller may immediately reuse a stateful, non-thread-safe reader: mu is
+	// per-call and cannot order a straggler from this call against the next
+	// call's workers. The single exception is the caller's own ctx firing — a
+	// worker wedged inside a blocking rand.Read would otherwise park Solve
+	// forever, so join yields and the wedged worker keeps the reader borrowed.
+	join := func() {
+		cancel()
+		select {
+		case <-idle:
+		case <-ext.Done():
+		}
+	}
+	defer join()
 
 	// Return on the first outcome, or on ctx cancellation. The ctx branch covers
 	// both an external deadline/cancel and a worker wedged in a blocking reader:

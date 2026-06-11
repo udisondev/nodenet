@@ -42,3 +42,28 @@ func TestDeliverDoesNotHoldMuAcrossSend(t *testing.T) {
 		t.Fatalf("deliver returned %v, want nil", err)
 	}
 }
+
+// TestDeliverAvoidsTransportMutex (regression): deliver is the per-frame hot path —
+// every read loop calls it for every inbound frame — while t.mu is the connection
+// control plane's lock, write-held on every admission, registration and teardown.
+// Frame delivery must not acquire t.mu at all, or a flood of connection churn would
+// add its lock traffic as latency to data delivery on every live edge.
+func TestDeliverAvoidsTransportMutex(t *testing.T) {
+	tr := &quicTransport{
+		in:   make(chan transport.Delivery, 1),
+		done: make(chan struct{}),
+	}
+	tr.mu.Lock() // the control plane mid-churn (admission/teardown holds the write lock)
+	defer tr.mu.Unlock()
+
+	delivered := make(chan error, 1)
+	go func() { delivered <- tr.deliver(transport.Delivery{}, nil) }()
+	select {
+	case err := <-delivered:
+		if err != nil {
+			t.Fatalf("deliver returned %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("deliver blocked on t.mu: the per-frame path takes the control-plane lock")
+	}
+}

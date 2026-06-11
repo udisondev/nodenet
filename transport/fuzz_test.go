@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"errors"
 	"slices"
 	"testing"
 )
@@ -75,22 +76,39 @@ func FuzzParseMediaFrame(f *testing.F) {
 }
 
 // FuzzParseAddrs is the same contract for the counted-list decoder: no panics on
-// arbitrary input, and an accepted list re-encodes and re-parses to itself.
+// arbitrary input, and an accepted list re-encodes and re-parses to itself. The
+// capped form is checked against the same input: with the cap at the parsed count
+// it must agree with ParseAddrs exactly, and one below it must refuse with
+// ErrTooManyAddrs — before allocating, though only the agreement is observable
+// here (the allocation bound is asserted in TestParseAddrsNRejectsOverCount).
 func FuzzParseAddrs(f *testing.F) {
 	f.Add([]byte{0})
 	f.Add(AppendAddrs(nil, []Addr{{Net: "mem", Endpoint: "a"}, {Net: "quic", Endpoint: "h:1"}}))
 	f.Add([]byte{0xff, 0xff, 0xff, 0xff, 0x0f})
 	f.Add([]byte{2, 0})
+	f.Add(floodAddrsList(1000))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		addrs, n, err := ParseAddrs(b)
 		if err != nil {
 			if addrs != nil || n != 0 {
 				t.Fatalf("ParseAddrs(%x) = %+v, n=%d alongside err %v; want zero values", b, addrs, n, err)
 			}
+			if _, _, errN := ParseAddrsN(b, len(b)); errN == nil {
+				t.Fatalf("ParseAddrsN(%x) accepted what ParseAddrs refused (%v)", b, err)
+			}
 			return
 		}
 		if n < 1 || n > len(b) {
 			t.Fatalf("ParseAddrs(%x) consumed n=%d of %d bytes", b, n, len(b))
+		}
+		addrsN, nN, err := ParseAddrsN(b, len(addrs))
+		if err != nil || !slices.Equal(addrsN, addrs) || nN != n {
+			t.Fatalf("ParseAddrsN at the cap = %+v, n=%d, err=%v; want ParseAddrs result", addrsN, nN, err)
+		}
+		if len(addrs) > 0 {
+			if _, _, err := ParseAddrsN(b, len(addrs)-1); !errors.Is(err, ErrTooManyAddrs) {
+				t.Fatalf("ParseAddrsN below the cap: err = %v, want ErrTooManyAddrs", err)
+			}
 		}
 		enc := AppendAddrs(nil, addrs)
 		if len(enc) != AddrsWireLen(addrs) {

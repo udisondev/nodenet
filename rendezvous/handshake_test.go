@@ -1,6 +1,7 @@
 package rendezvous
 
 import (
+	"encoding/binary"
 	"errors"
 	"reflect"
 	"testing"
@@ -146,6 +147,72 @@ func TestDecodeRejectsTrailingJunk(t *testing.T) {
 	}
 }
 
+// floodPayload builds a Hello/Reply payload whose address list declares cnt
+// entries over 2*cnt zero bytes (each 0x00 0x00 = one empty address), framed by
+// lead prefix bytes (the public keys) and the trailing nonce+sig. Without a count
+// cap the whole declared count allocates and parses.
+func floodPayload(lead, cnt int) []byte {
+	b := make([]byte, 0, lead+binary.MaxVarintLen64+2*cnt+NonceLen+64)
+	b = append(b, make([]byte, lead)...)
+	b = binary.AppendUvarint(b, uint64(cnt))
+	b = append(b, make([]byte, 2*cnt)...)
+	return append(b, make([]byte, NonceLen+64)...)
+}
+
+// TestDecodeRejectsAddrFlood: a payload declaring an absurd address count (~500k
+// over ~1 MiB of zeros) must be refused before the slice is allocated — otherwise
+// every delivered frame costs a ~16 MiB zeroed allocation on the dispatch
+// goroutine, and the Reply path runs before any signature or nonce check. A real
+// hello/reply carries a handful of coordinates, so the cap rejects nothing
+// legitimate.
+func TestDecodeRejectsAddrFlood(t *testing.T) {
+	const cnt = 500_000
+	var h Hello
+	var rep Reply
+	hello := floodPayload(len(h.XPub), cnt)
+	reply := floodPayload(len(rep.EdPub)+len(rep.XPub), cnt)
+	if allocs := testing.AllocsPerRun(10, func() {
+		if _, err := DecodeHello(hello); !errors.Is(err, transport.ErrTooManyAddrs) {
+			t.Fatalf("DecodeHello(flood): err = %v, want transport.ErrTooManyAddrs", err)
+		}
+		if _, err := DecodeReply(reply); !errors.Is(err, transport.ErrTooManyAddrs) {
+			t.Fatalf("DecodeReply(flood): err = %v, want transport.ErrTooManyAddrs", err)
+		}
+	}); allocs != 0 {
+		t.Errorf("flood rejection allocated %.0f times, want 0", allocs)
+	}
+}
+
+// The protocol cap is symmetric: the encoders refuse a list the decoders would
+// reject, and a list exactly at the cap round-trips.
+func TestAddrCapBoundary(t *testing.T) {
+	atCap := make([]transport.Addr, maxCoordAddrs)
+	h := Hello{Addrs: atCap}
+	hb, err := MarshalHello(&h)
+	if err != nil {
+		t.Fatalf("MarshalHello(at cap): %v", err)
+	}
+	if got, err := DecodeHello(hb); err != nil || len(got.Addrs) != maxCoordAddrs {
+		t.Fatalf("DecodeHello(at cap) = %d addrs, err %v", len(got.Addrs), err)
+	}
+	rep := Reply{Addrs: atCap}
+	rb, err := MarshalReply(&rep)
+	if err != nil {
+		t.Fatalf("MarshalReply(at cap): %v", err)
+	}
+	if got, err := DecodeReply(rb); err != nil || len(got.Addrs) != maxCoordAddrs {
+		t.Fatalf("DecodeReply(at cap) = %d addrs, err %v", len(got.Addrs), err)
+	}
+
+	over := make([]transport.Addr, maxCoordAddrs+1)
+	if _, err := MarshalHello(&Hello{Addrs: over}); !errors.Is(err, transport.ErrTooManyAddrs) {
+		t.Fatalf("MarshalHello(over cap): err = %v, want transport.ErrTooManyAddrs", err)
+	}
+	if _, err := MarshalReply(&Reply{Addrs: over}); !errors.Is(err, transport.ErrTooManyAddrs) {
+		t.Fatalf("MarshalReply(over cap): err = %v, want transport.ErrTooManyAddrs", err)
+	}
+}
+
 func FuzzDecodeHello(f *testing.F) {
 	a := idFromSeed(1)
 	h := Hello{XPub: a.KEXPublic(), Addrs: sampleAddrs(), Nonce: [NonceLen]byte{1}}
@@ -159,11 +226,15 @@ func FuzzDecodeHello(f *testing.F) {
 	}
 	f.Add([]byte{})
 	f.Add([]byte{0xff, 0xff, 0xff, 0xff, 0x0f}) // huge declared addr count
+	f.Add(floodPayload(32, 1000))               // over-cap count with a parseable body
 
 	f.Fuzz(func(t *testing.T, b []byte) {
 		got, err := DecodeHello(b) // must never panic
 		if err != nil {
 			return
+		}
+		if len(got.Addrs) > maxCoordAddrs {
+			t.Fatalf("decoded %d addrs, cap is %d", len(got.Addrs), maxCoordAddrs)
 		}
 		buf, err := MarshalHello(&got)
 		if err != nil {
@@ -189,11 +260,15 @@ func FuzzDecodeReply(f *testing.F) {
 	}
 	f.Add([]byte{})
 	f.Add([]byte{0xff, 0xff, 0xff, 0xff, 0x0f})
+	f.Add(floodPayload(64, 1000)) // over-cap count with a parseable body
 
 	f.Fuzz(func(t *testing.T, b []byte) {
 		got, err := DecodeReply(b) // must never panic
 		if err != nil {
 			return
+		}
+		if len(got.Addrs) > maxCoordAddrs {
+			t.Fatalf("decoded %d addrs, cap is %d", len(got.Addrs), maxCoordAddrs)
 		}
 		buf, err := MarshalReply(&got)
 		if err != nil {

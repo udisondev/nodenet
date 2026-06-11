@@ -1,6 +1,7 @@
 package nat
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"github.com/udisondev/nodenet/kad"
@@ -8,19 +9,26 @@ import (
 	"github.com/udisondev/nodenet/wire"
 )
 
-// FuzzConnect feeds arbitrary bytes to the Connect decoder: it must never panic, and
-// anything that decodes must survive a re-encode/re-decode round trip unchanged.
+// FuzzConnect feeds arbitrary bytes to the Connect decoder: it must never panic,
+// anything that decodes must survive a re-encode/re-decode round trip unchanged, and
+// a decoded candidate list never exceeds the protocol cap.
 func FuzzConnect(f *testing.F) {
 	f.Add([]byte{})
 	f.Add(make([]byte, NonceLen)) // valid: nonce + zero addrs
 	if b, err := MarshalConnect(&Connect{Addrs: []transport.Addr{{Net: "quic", Endpoint: "1.2.3.4:5"}}}); err == nil {
 		f.Add(b)
 	}
+	// Over-cap count over a parseable body of empty addresses: must be refused.
+	flood := binary.AppendUvarint(make([]byte, NonceLen), 1000)
+	f.Add(append(flood, make([]byte, 2000)...))
 
 	f.Fuzz(func(t *testing.T, b []byte) {
 		c, err := DecodeConnect(b)
 		if err != nil {
 			return
+		}
+		if len(c.Addrs) > maxConnectAddrs {
+			t.Fatalf("decoded %d addrs, cap is %d", len(c.Addrs), maxConnectAddrs)
 		}
 		re, err := MarshalConnect(&c)
 		if err != nil {

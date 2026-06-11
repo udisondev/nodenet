@@ -25,6 +25,22 @@ func BenchmarkKnowledgeObserveRefresh(b *testing.B) {
 	}
 }
 
+// BenchmarkKnowledgeObserveRefreshSameAddrs measures the address-carrying refresh
+// in its steady state: neighbours-learning and sibling-exchange re-deliver a
+// contact's unchanged addresses every round, and the already-owned stored copy
+// must not be re-cloned. Target: 0 allocs/op.
+func BenchmarkKnowledgeObserveRefreshSameAddrs(b *testing.B) {
+	var self kad.ID
+	k := NewKnowledge(self, nil, 0)
+	c := contactInBucket(self, 10, 1)
+	c.Addrs = []transport.Addr{{Net: "quic", Endpoint: "192.0.2.7:443"}}
+	k.Observe(c, t0)
+	b.ReportAllocs()
+	for b.Loop() {
+		k.Observe(c, t0)
+	}
+}
+
 // BenchmarkKnowledgeClosest measures the candidate-selection path that feeds
 // greedy routing. With a pre-sized buffer it must not allocate. Target: 0
 // allocs/op.

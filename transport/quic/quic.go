@@ -265,20 +265,18 @@ func (t *quicTransport) removeConn(c *quicConn) {
 	t.mu.Unlock()
 }
 
-// deliver pushes one frame onto the inbound stream. It checks closed under the read
-// lock but releases it BEFORE the (possibly blocking) channel send: the single Inbound
-// consumer closes edges synchronously (quicConn.Close → removeConn → t.mu.Lock), so a
-// deliver parked on a full channel while holding the lock would deadlock the whole
-// transport against its own consumer. Closing t.in underneath a parked send cannot
-// happen anyway: every deliver caller is a wg-tracked read loop, and Close wg.Wait()s
-// before close(t.in). The select on done unblocks a backpressured send at shutdown.
+// deliver pushes one frame onto the inbound stream. It deliberately touches nothing
+// but the two channels — no t.mu, in either mode: this is the per-frame hot path of
+// every read loop, while t.mu is the connection control plane's lock, write-held on
+// every admission, registration and teardown, so even a read lock here would let a
+// flood of connection churn add its lock traffic as latency to data delivery on every
+// live edge (and a lock held ACROSS the send would outright deadlock against the
+// single Inbound consumer, which closes edges synchronously: quicConn.Close →
+// removeConn → t.mu.Lock). No closed check is needed for safety either: every deliver
+// caller is a wg-tracked read loop, and Close closes t.done before wg.Wait()ing them
+// out ahead of close(t.in) — so a send on a closed t.in is impossible and the done arm
+// unblocks a backpressured send at shutdown.
 func (t *quicTransport) deliver(d transport.Delivery, _ *quicConn) error {
-	t.mu.RLock()
-	closed := t.closed
-	t.mu.RUnlock()
-	if closed {
-		return transport.ErrConnClosed
-	}
 	select {
 	case t.in <- d:
 		return nil

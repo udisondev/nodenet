@@ -42,10 +42,19 @@ type memTransport struct {
 	inMedia chan transport.MediaSession // inbound media sessions; closed by Close
 	done    chan struct{}               // closed first by Close to unblock in-flight delivers
 
-	mu     sync.RWMutex // guards closed/conns/media; RLock held across a delivery into in
+	mu     sync.RWMutex // guards closed; RLock held across a delivery into in so Close cannot close the channel underneath
 	closed bool
-	conns  []*memConn
-	media  []*memMediaSession
+
+	// connsMu guards the registration lists alone and is never held across a
+	// blocking send, so deregistering one edge cannot wait behind a deliver
+	// parked on another edge's frame under mu. That matters because the node's
+	// dispatch loop — the only Inbound consumer — closes edges synchronously:
+	// a removeConn waiting for a parked deliver would deadlock the transport
+	// against its own consumer (the QUIC transport's deliver avoids the same
+	// trap by releasing its lock before the channel send).
+	connsMu sync.Mutex
+	conns   []*memConn
+	media   []*memMediaSession
 
 	closeOnce sync.Once
 }
@@ -101,13 +110,12 @@ func (t *memTransport) Dial(
 }
 
 // removeConn deregisters c from this transport's conn list (swap-removal). It is a
-// no-op if c is absent or the transport is already closed (Close took the whole list).
+// no-op if c is absent (already removed, or Close took the whole list — the scan of
+// the nil snapshot finds nothing). It takes only connsMu, so Conn.Close stays a
+// light operation that never waits behind a parked deliver.
 func (t *memTransport) removeConn(c *memConn) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.closed {
-		return
-	}
+	t.connsMu.Lock()
+	defer t.connsMu.Unlock()
 	for i, x := range t.conns {
 		if x == c {
 			last := len(t.conns) - 1
@@ -120,14 +128,20 @@ func (t *memTransport) removeConn(c *memConn) {
 }
 
 // addConn registers a conn for Close cleanup; it reports false if the transport
-// is already closed.
+// is already closed. Holding mu's read lock across the append pairs the add with
+// Close: a conn either lands before Close's write lock — and is then in the
+// snapshot Close tears down — or the add observes closed and is refused. The
+// nesting order is always mu before connsMu, and connsMu is never held across
+// anything blocking, so the pair cannot deadlock.
 func (t *memTransport) addConn(c *memConn) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	if t.closed {
 		return false
 	}
+	t.connsMu.Lock()
 	t.conns = append(t.conns, c)
+	t.connsMu.Unlock()
 	return true
 }
 
@@ -135,17 +149,19 @@ func (t *memTransport) addConn(c *memConn) bool {
 // for the whole channel operation so Close cannot close in underneath it, and
 // selects on done and the edge so a backpressured send is freed when either the
 // receiving transport or the edge closes. With a Hub send bound set, a deliver that
-// cannot make progress within the bound returns ErrConnClosed — mirroring the QUIC
-// send deadline so a stalled receiver cannot wedge the sender forever.
+// cannot make progress within the bound closes the edge and returns ErrConnClosed —
+// mirroring the QUIC send deadline so a stalled receiver cannot wedge the sender
+// forever.
 func (t *memTransport) deliver(d transport.Delivery, e *edge) error {
 	return t.deliverBounded(d, e, t.hub.sendBound)
 }
 
 // deliverBounded is deliver with an explicit per-send bound: a non-positive bound is
-// unbounded (the historical default), a positive one returns ErrConnClosed if the
-// send cannot make progress within it. The node's forward path passes a positive
-// bound so a stalled receiver cannot wedge the single dispatch loop even when the Hub
-// has no global send bound. Under testing/synctest the bound runs on the fake clock.
+// unbounded (the historical default), a positive one closes the edge and returns
+// ErrConnClosed if the send cannot make progress within it. The node's forward path
+// passes a positive bound so a stalled receiver cannot wedge the single dispatch loop
+// even when the Hub has no global send bound. Under testing/synctest the bound runs
+// on the fake clock.
 func (t *memTransport) deliverBounded(d transport.Delivery, e *edge, bound time.Duration) error {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -182,6 +198,12 @@ func (t *memTransport) deliverBounded(d transport.Delivery, e *edge, bound time.
 	case <-e.closed:
 		return transport.ErrConnClosed
 	case <-timer.C:
+		// A tripped bound means the receiver stalled past its budget: declare the
+		// edge dead and tear it down for BOTH ends, exactly like the QUIC conn
+		// closing itself on a tripped send deadline. ErrConnClosed must never be
+		// reported for an edge that is still alive — the peer would keep sending
+		// on a link this side has already written off.
+		e.close()
 		return transport.ErrConnClosed
 	}
 }
@@ -190,18 +212,24 @@ func (t *memTransport) deliverBounded(d transport.Delivery, e *edge, bound time.
 // the inbound streams. It closes done first to unblock any in-flight delivery,
 // then takes the write lock (which drains RLock-holding delivers) before
 // closing in and inMedia, so neither is ever closed with a sender still
-// writing to it. Media sessions finish asynchronously: closing their shared
-// edges makes each pump unwind and drain its own channels. Idempotent.
+// writing to it. The registration lists are snapshotted under connsMu after
+// closed is set: a registration racing Close either landed before the write
+// lock (and is in the snapshot) or observes closed and is refused, so no edge
+// escapes the teardown. Media sessions finish asynchronously: closing their
+// shared edges makes each pump unwind and drain its own channels. Idempotent.
 func (t *memTransport) Close() error {
 	t.closeOnce.Do(func() {
 		close(t.done)
 		t.mu.Lock()
 		t.closed = true
+		t.mu.Unlock()
+
+		t.connsMu.Lock()
 		conns := t.conns
 		t.conns = nil
 		media := t.media
 		t.media = nil
-		t.mu.Unlock()
+		t.connsMu.Unlock()
 
 		for _, c := range conns {
 			c.edge.close()

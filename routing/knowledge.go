@@ -118,11 +118,12 @@ func (k *Knowledge) Observe(c Contact, now time.Time) (outcome ObserveOutcome, p
 		// bypass the cap (admit with no recognizable subnet, then point the entry into
 		// a saturated one). Re-derive only when the observation actually brings other
 		// addresses, so the common same-address refresh stays free.
-		if len(c.Addrs) > 0 && !slices.Equal(e.Addrs, c.Addrs) {
+		addrsChanged := len(c.Addrs) > 0 && !slices.Equal(e.Addrs, c.Addrs)
+		if addrsChanged {
 			k.deriveSubnet(&c)
 			if c.hasSubnet != e.hasSubnet || c.subnet != e.subnet {
 				if c.hasSubnet && k.subnetCnt[c.subnet] >= SubnetCap {
-					c.Addrs = nil // new subnet full: refuse the address update, keep the rest
+					addrsChanged = false // new subnet full: refuse the address update, keep the rest
 				} else {
 					if e.hasSubnet {
 						k.decSubnet(e.subnet)
@@ -135,6 +136,12 @@ func (k *Knowledge) Observe(c Contact, now time.Time) (outcome ObserveOutcome, p
 			}
 		}
 		mergeLearned(&e, c)
+		if addrsChanged {
+			// Clone so the stored entry owns its address backing instead of pinning the
+			// shared decode buffer of a whole neighbours answer. An identical-address
+			// refresh keeps the entry's own previously-cloned backing — no alloc.
+			e.Addrs = cloneAddrs(c.Addrs)
+		}
 		e.lastSeen = now
 		moveToFront(b.entries, i, e)
 		return ObserveInserted, kad.ID{}
@@ -482,10 +489,11 @@ func moveToFront(s []Contact, i int, e Contact) {
 }
 
 // mergeLearned folds newly-learned fields of c into e without clobbering known
-// values with zeros: a refresh from a packet that carries only an address must not
-// erase a previously-learned ed_pub. XPub is deliberately absent: it enters the
-// table only through BindXPub (see Observe). It copies fixed-size values only — no
-// alloc.
+// values with zeros: a refresh from a packet that carries an address but no key must
+// not erase a previously-learned ed_pub. XPub is deliberately absent: it enters the
+// table only through BindXPub (see Observe). Addresses are also absent: Observe owns
+// their merge, next to the subnet accounting and the changed-check that already
+// decided whether a clone is due. It copies fixed-size values only — no alloc.
 func mergeLearned(e *Contact, c Contact) {
 	var zero [32]byte
 	if c.EdPub != zero {
@@ -493,11 +501,6 @@ func mergeLearned(e *Contact, c Contact) {
 	}
 	if c.Caps != 0 {
 		e.Caps = c.Caps
-	}
-	if len(c.Addrs) > 0 {
-		// Clone so a stored entry owns its address backing instead of pinning the
-		// shared decode buffer of a whole neighbours answer.
-		e.Addrs = cloneAddrs(c.Addrs)
 	}
 }
 

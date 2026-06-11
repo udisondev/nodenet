@@ -83,6 +83,11 @@ func (c *memConn) SendBounded(p *transport.Packet, d time.Duration) error {
 	if c.peerOwner.hub.isBlocked(c.peerConn.remote, c.remote) {
 		return nil
 	}
+	if d <= 0 {
+		// Fall back to the Hub bound, as the QUIC conn falls back to its
+		// transport's send deadline (sendBound is immutable after NewHub).
+		d = c.peerOwner.hub.sendBound
+	}
 	dst := transport.Get()
 	dst.SetLen(copy(dst.Buf(), p.Bytes()))
 	if err := c.peerOwner.deliverBounded(transport.Delivery{Conn: c.peerConn, Pkt: dst}, c.edge, d); err != nil {

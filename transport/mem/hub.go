@@ -42,9 +42,12 @@ func WithInboundBuffer(n int) HubOption {
 // WithSendBound caps how long a Send may block on a backpressured (full,
 // undrained) inbound channel before it returns ErrConnClosed, mirroring the QUIC
 // transport's send deadline so a stalled neighbour cannot wedge a sender forever.
-// The default is 0 (unbounded — the historical behaviour). Under testing/synctest
-// the bound runs on the fake clock, so it stays deterministic. The fast path (room
-// in the channel) never arms a timer, so a set bound costs nothing when traffic flows.
+// A tripped bound also closes the edge for both ends — on QUIC a tripped send
+// deadline tears the connection down, and ErrConnClosed always means the edge is
+// really down. The default is 0 (unbounded — the historical behaviour). Under
+// testing/synctest the bound runs on the fake clock, so it stays deterministic.
+// The fast path (room in the channel) never arms a timer, so a set bound costs
+// nothing when traffic flows.
 func WithSendBound(d time.Duration) HubOption {
 	return func(h *Hub) { h.sendBound = d }
 }
